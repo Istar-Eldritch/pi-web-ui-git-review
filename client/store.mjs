@@ -13,16 +13,35 @@
  * 环境守卫。
  */
 
+/**
+ * localStorage 访问收口：环境里没有（node --test）或被禁（隐私模式）→ null。
+ * 刻意**每次调用时再判**而非模块加载时定格 —— 同进程里后装的桩（测试）也能生效。
+ */
+function localStorageOrNull() {
+	try {
+		return globalThis.localStorage ?? null;
+	} catch {
+		return null;
+	}
+}
+
 /** 共享单例：同一页面里所有 mount 共用这一份。 */
 const state = {
 	/** 导航里选中的文件（/review.files[].path）—— viewer 据此拉 /diff。 */
 	selectedPath: null,
-	/** 本次会话的基线覆盖（ref 字符串）；null = 跟随存储的 marker。覆盖永不落 marker。 */
+	/**
+	 * 本次会话的基线覆盖（R5）；null = 跟随存储的 marker。形态 { ref, source }，
+	 * source 记用户选择的类别（"branch" | "commit" | "manual"）。
+	 * 刻意**不落 localStorage**（spec Solution Approach：覆盖仅本次会话有效），
+	 * 也永不写服务端 marker —— 覆盖只影响这一次 /review?base= 请求。
+	 */
 	baseOverride: null,
-	/** 最近一次 /review 载荷（viewer 用它的 flags/counts/base，避免重复请求）。 */
+	/** 最近一次 /review 载荷（Phase 1 契约形态 {base,head,files,total,truncated}；
+	 *  viewer 用它的 flags/counts/base，避免重复请求）。 */
 	lastReview: null,
-	/** 视图模式（R6，Phase 2 接 localStorage 持久化）：tree|flat × changed|full。 */
-	viewModes: { layout: "flat", scope: "changed" },
+	/** 视图模式（R6）：layout tree|flat × scope changed|full；模块加载时即从
+	 *  localStorage 恢复（守卫见 loadViewModes —— 无 localStorage 的环境用默认值）。 */
+	viewModes: loadViewModes(),
 	/** 行级/文件级评论草稿（Phase 4）：key = `${path}\u0000${side}\u0000${line}` → { text, … }。
 	 *  分隔符选 NUL（路径与行号都不可能含它）。这里必须写成 \u0000 转义而不是原始
 	 *  0x00 字节 —— 原始 NUL 会让 git 把本文件当二进制（"Binary files differ"），
@@ -38,10 +57,7 @@ export function getState() {
 	return state;
 }
 
-/** 浅合并 patch 并通知订阅者（两个 mount 之间的同步通道）。 */
-export function setState(patch) {
-	if (!patch || typeof patch !== "object") return state;
-	Object.assign(state, patch);
+function notify() {
 	for (const fn of [...listeners]) {
 		try {
 			fn(state);
@@ -49,7 +65,49 @@ export function setState(patch) {
 			/* 单个订阅者出错不拖垮其它 */
 		}
 	}
+}
+
+/** 浅合并 patch 并通知订阅者（两个 mount 之间的同步通道）。 */
+export function setState(patch) {
+	if (!patch || typeof patch !== "object") return state;
+	Object.assign(state, patch);
+	notify();
 	return state;
+}
+
+/**
+ * 视图模式 setter（R6）：合并 patch → localStorage 持久化（守卫，存不下就下次用默认）
+ * → 通知订阅者。layout: "tree"|"flat"；scope: "changed"|"full"。
+ */
+export function setViewModes(patch) {
+	const next = {
+		layout: patch && patch.layout === "tree" ? "tree" : patch && patch.layout === "flat" ? "flat" : state.viewModes.layout,
+		scope: patch && patch.scope === "full" ? "full" : patch && patch.scope === "changed" ? "changed" : state.viewModes.scope,
+	};
+	state.viewModes = next;
+	saveViewModes(next);
+	notify();
+	return next;
+}
+
+/**
+ * 基线覆盖 setter（R5）。null = 清除覆盖（回到跟随 marker）；对象 = { ref, source? }
+ * （source 缺省 "override"）。只动模块状态，不碰 localStorage、不碰服务端 marker。
+ */
+export function setBaseOverride(override) {
+	state.baseOverride =
+		override === null || override === undefined
+			? null
+			: { ref: String(override.ref ?? ""), source: String(override.source ?? "override") };
+	notify();
+	return state.baseOverride;
+}
+
+/** 记录最近一次 /review 载荷（Phase 1 契约形态）；viewer 跨 tab 复用。 */
+export function setLastReview(review) {
+	state.lastReview = review ?? null;
+	notify();
+	return state.lastReview;
 }
 
 /** 订阅状态变化；返回注销函数（mount cleanup 时必须调用）。 */
@@ -59,13 +117,12 @@ export function subscribe(fn) {
 	return () => listeners.delete(fn);
 }
 
-const hasLocalStorage = typeof localStorage !== "undefined";
-
 /** 视图模式持久化（R6：跨会话记忆）。Phase 2 起 navigator 调用。 */
 export function loadViewModes(fallback = { layout: "flat", scope: "changed" }) {
-	if (!hasLocalStorage) return { ...fallback };
+	const ls = localStorageOrNull();
+	if (!ls) return { ...fallback };
 	try {
-		const raw = localStorage.getItem("git-review.viewModes");
+		const raw = ls.getItem("git-review.viewModes");
 		if (!raw) return { ...fallback };
 		const parsed = JSON.parse(raw);
 		return {
@@ -78,9 +135,10 @@ export function loadViewModes(fallback = { layout: "flat", scope: "changed" }) {
 }
 
 export function saveViewModes(modes) {
-	if (!hasLocalStorage) return;
+	const ls = localStorageOrNull();
+	if (!ls) return;
 	try {
-		localStorage.setItem("git-review.viewModes", JSON.stringify(modes ?? {}));
+		ls.setItem("git-review.viewModes", JSON.stringify(modes ?? {}));
 	} catch {
 		/* 存不下就下次用默认 —— 非关键路径 */
 	}

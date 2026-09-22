@@ -14,11 +14,14 @@
  *   依赖会在 README（Phase 4）里记录；判定逻辑收口在 detectRole() 一个函数里，
  *   宿主改类名时只改这一处。
  *
- * Phase 1 = 骨架 + 占位渲染：不拉数据、不画列表、不画 diff（后续 Phase 的
- * navigator.mjs / viewer.mjs 会替换占位实现）。选中状态等跨 mount 共享走
- * client/store.mjs（模块级单例）。
+ * Phase 2 = 导航角色接真实现：navigator.mjs 消费 Phase 1 的受信路由（/review
+ * /refs /commits /marker /resolve /tree，全局 fetch + 由 bundle URL 推导的
+ * apiBase —— notes 插件同款通道；宿主 ctx 只有 send/onData，ctx.onData 用于收
+ * 服务端的 cwd-changed 广播触发重拉）。viewer 角色仍是占位（Phase 3 接 diff 渲染）。
+ * 选中状态等跨 mount 共享走 client/store.mjs（模块级单例）。
  */
-import * as store from "./store.mjs";
+import { createNavigator } from "./navigator.mjs";
+import { apiBaseFromUrl, subscribe } from "./store.mjs";
 
 /**
  * 角色检测：容器（或其任意祖先）带 `plugin-page-host` → navigator；
@@ -34,13 +37,14 @@ export function detectRole(el) {
 }
 
 function placeholderRoot(role) {
-	const root = document.createElement("div");
+	const doc = globalThis.document;
+	const root = doc.createElement("div");
 	root.className = `git-review-root git-review-${role}`;
 	root.style.cssText = "font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:12px;";
-	const title = document.createElement("div");
+	const title = doc.createElement("div");
 	title.textContent = role === "navigator" ? "🔀 Diff 评审 · 导航（占位）" : "🔀 Diff Review · viewer (placeholder)";
 	title.style.cssText = "font-weight:600;margin-bottom:6px;";
-	const note = document.createElement("div");
+	const note = doc.createElement("div");
 	note.style.cssText = "opacity:.65;white-space:pre-line;";
 	note.textContent =
 		role === "navigator"
@@ -53,18 +57,33 @@ function placeholderRoot(role) {
 export default {
 	/**
 	 * 宿主挂载入口。ctx = { pluginId, send(payload), onData(cb) }（plugin-loader.ts:21）。
-	 * Phase 1 不用 ctx（不通信、不订阅）；返回的 cleanup 必须把本次挂的 DOM 和
-	 * 订阅清干净（R15 双挂载对称清理）。
+	 * navigator 角色把 ctx 传给视图（onData 收 cwd-changed 广播）；viewer 角色暂不用。
+	 * 返回的 cleanup 必须把本次挂的 DOM 和订阅清干净（R15 双挂载对称清理）。
 	 */
-	mount(el, _ctx) {
+	mount(el, ctx) {
 		if (!el) return () => {};
 		el.textContent = "";
 		const role = detectRole(el);
+		if (role === "navigator") {
+			// 右栏导航：消费 Phase 1 路由的真实现（数据通道见文件头注释）。
+			const nav = createNavigator({
+				apiBase: apiBaseFromUrl(import.meta.url),
+				ctx,
+				document: el.ownerDocument ?? globalThis.document,
+			});
+			el.appendChild(nav.root);
+			void nav.refresh(); // 首次装载（视图自身只渲染 loading 态，不自动发请求，便于测试确定性）
+			return () => {
+				nav.destroy();
+				el.textContent = "";
+			};
+		}
+		// viewer 占位（Phase 3 接 diff 渲染）。
 		const root = placeholderRoot(role);
 		el.appendChild(root);
-		// 订阅共享状态（Phase 2/3 起两个角色靠它联动）；退订句柄交给 cleanup，
+		// 订阅共享状态（Phase 3 起两个角色靠它联动）；退订句柄交给 cleanup，
 		// 证明「mount 配对 cleanup」的对称性从骨架期就成立。
-		const unsubscribe = store.subscribe(() => {});
+		const unsubscribe = subscribe(() => {});
 		return () => {
 			unsubscribe();
 			root.remove();

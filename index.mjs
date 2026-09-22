@@ -26,6 +26,8 @@
  *   GET  /marker         → { ok, sha: string|null, repoRoot }（每仓库根一个 key）
  *   POST /marker {sha}   → { ok, sha }（先 rev-parse 校验成完整哈希再存）
  *   GET  /resolve?ref=   → { ok, ref, sha }（ref → 完整提交哈希；基线选择器用）
+ *   GET  /tree           → { ok, files:[path…], total, truncated }（全工作区文件树，R6：
+ *                          `git ls-files` + status untracked 并入，仓库根相对，截断同 /review）
  *
  * 每条失败路径都是结构化 `{ ok:false, error }`（R13）：不是 git 仓库、未知/非法
  * base、stale marker、非法参数……一律可恢复错误，绝不抛穿。HTTP 状态保持 200，
@@ -46,6 +48,7 @@ import {
 	parseNumStatZ,
 	parseStatusFiles,
 	parseUnifiedDiff,
+	parseLsFilesZ,
 	validateLimit,
 	validatePath,
 	validateRef,
@@ -240,6 +243,34 @@ async function reviewPayload(host, root, rawBase) {
 	};
 }
 
+/** /tree：全工作区文件树（R6）= `git ls-files`（已跟踪）+ status untracked 并入。
+ *  与 /review 同一个条数上限（MAX_FILES）与截断语义（total 保全、truncated:true），
+ *  树结构由客户端从平铺路径自建 —— 服务端只给排序后的去重路径数组。 */
+async function treePayload(root) {
+	const [lsOut, statusText] = await Promise.all([
+		git(root, ["ls-files", "-z"]),
+		git(root, ["status", "--porcelain=v1", "--untracked-files=all"]),
+	]);
+	const seen = new Set();
+	const files = [];
+	for (const p of parseLsFilesZ(lsOut)) {
+		if (seen.has(p)) continue;
+		seen.add(p);
+		files.push(p);
+	}
+	// untracked 与 ls-files 不相交，但 status 一次查询还兼着「将来加别的来源」的口子，
+	// 照 /review 的并入写法保持一致。
+	for (const f of parseStatusFiles(statusText)) {
+		if (f.x !== "?" || f.y !== "?" || seen.has(f.path)) continue;
+		seen.add(f.path);
+		files.push(f.path);
+	}
+	files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+	const total = files.length;
+	const truncated = total > MAX_FILES; // 与 /review 同一上限、同一截断语义（R16）
+	return { ok: true, files: truncated ? files.slice(0, MAX_FILES) : files, total, truncated };
+}
+
 /** /diff：单文件 merge-base(base) → 工作树 补丁 → 结构化 hunks（R8/R16）。
  *
  * rename 的坑：pathspec 会拆散 rename 检测（`-- 新路径` 把 rename 显示成全量新增，
@@ -406,6 +437,10 @@ export default {
 			res.json({ ok: true, sha });
 		}));
 
+		route("GET", "/tree", withRepo(async (root, _req, res) => {
+			res.json(await treePayload(root));
+		}));
+
 		route("GET", "/resolve", withRepo(async (root, req, res) => {
 			const raw = req?.query?.ref;
 			if (typeof raw !== "string" || raw.trim() === "") {
@@ -435,7 +470,7 @@ export default {
 		);
 
 		try {
-			host.log("info", "[git-review] routes registered: /review /diff /refs /commits /marker /resolve");
+			host.log("info", "[git-review] routes registered: /review /diff /refs /commits /marker /resolve /tree");
 		} catch {
 			/* 日志不可用也不影响激活 */
 		}

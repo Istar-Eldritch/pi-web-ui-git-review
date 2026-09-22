@@ -10,6 +10,7 @@ import {
 	markerKey,
 	normalizeRootPath,
 	parseBranches,
+	parseLsFilesZ,
 	parseNameStatus,
 	parseNumStat,
 	parseNumStatZ,
@@ -190,6 +191,18 @@ describe("parseNumStatZ (-z, unambiguous renames)", () => {
 	});
 	it("accumulates duplicate paths", () => {
 		assert.deepEqual(parseNumStatZ("1\t2\tx\u0000\u00003\t4\tx\u0000"), { x: [4, 6] });
+	});
+});
+
+describe("parseLsFilesZ (ls-files -z)", () => {
+	it("returns [] for empty output", () => {
+		assert.deepEqual(parseLsFilesZ(""), []);
+	});
+	it("splits NUL-separated paths and drops the trailing empty token", () => {
+		assert.deepEqual(parseLsFilesZ("a\u0000b\u0000"), ["a", "b"]);
+	});
+	it("drops empty tokens (double/trailing NUL) and keeps spaces intact inside paths", () => {
+		assert.deepEqual(parseLsFilesZ("\u0000we ird.txt\u0000\u0000b\u0000"), ["we ird.txt", "b"]);
 	});
 });
 

@@ -9,6 +9,8 @@
 (async () => {
 	await import("./gitcore.test.mjs");
 	await import("./server-smoke.test.mjs");
+	await import("./tree-route.test.mjs");
+	await import("./navigator.test.mjs");
 })().catch((err) => {
 	console.error(err);
 	process.exitCode = 1;

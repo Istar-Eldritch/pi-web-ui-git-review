@@ -344,6 +344,17 @@ export function parseUnifiedDiff(text) {
 }
 
 /**
+ * 解析 `git ls-files -z`：NUL 分隔的仓库根相对路径数组（-z 下 git 不做 C 引号化，
+ * 路径原样字节输出）。空段丢弃 —— 尾随 NUL 会切出末尾空串。
+ * /tree 路由用（R6 全树视图）；不用文本形式是因为文件名可含换行。
+ */
+export function parseLsFilesZ(text) {
+	return String(text)
+		.split("\u0000")
+		.filter(Boolean);
+}
+
+/**
  * 把一段补丁文本截到 maxChars，保头去尾并追加可见截断标记。
  * scm.ts:390 capPatch 镜像（数值由调用方传入）。
  */
