@@ -65,18 +65,28 @@ export function createReviewSubmitter(opts = {}) {
 
 			// 成功 → marker 推进到 HEAD（R4/R11）：head.sha 已由 GET /review 解析
 			// （Phase 1 契约 /review → head:{sha}，无需额外 HEAD 解析路由）。
+			// 推进失败不回滚草稿（评审已交，下次提交仍可推进），但把结果如实上报：
+			// 路由永远 200 + {ok:false,error}（R13），所以既要捕捉网络异常也要看 ok 字段。
+			let markerAdvanced = false;
 			try {
-				await doFetch(`${api}/marker`, {
+				const res = await doFetch(`${api}/marker`, {
 					method: "POST",
 					credentials: "same-origin",
 					headers: { "content-type": "application/json" },
 					body: JSON.stringify({ sha: review.head.sha }),
 				});
+				// 载荷级 ok 才算推进成功 —— 传输层 ok（fetch 状态）不算（R13：路由永远
+				// 200 + {ok:false,error}，失败语义只在载荷里）。
+				let body = null;
+				if (typeof res?.text === "function") body = JSON.parse(await res.text());
+				else if (typeof res?.json === "function") body = await res.json();
+				else body = res;
+				markerAdvanced = body?.ok === true;
 			} catch {
-				/* 投递已成功；推进失败不回滚草稿（评审已交，下次提交仍可推进） */
+				/* 网络/解析异常 → markerAdvanced 保持 false */
 			}
 			clearDrafts();
-			return { ok: true, text };
+			return { ok: true, text, markerAdvanced };
 		},
 	};
 }

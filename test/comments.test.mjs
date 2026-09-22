@@ -481,7 +481,7 @@ describe("review submitter (entry wiring, R11)", () => {
 			store.setComment({ ...COMMENTS[0] });
 			store.setComment({ ...COMMENTS[1] });
 			const result = await harness.submitter.submit({ review: REVIEW_OK, summary: store.getSummary(), comments: store.getComments() });
-			assert.deepEqual(result, { ok: true, text: EXPECTED });
+			assert.deepEqual(result, { ok: true, text: EXPECTED, markerAdvanced: true });
 			// 桥投递：一次、只带 {text}（合并语义见 README —— 绝不读改既有草稿）
 			assert.equal(harness.composeCalls.length, 1);
 			assert.deepEqual(Object.keys(harness.composeCalls[0]), ["text"]);
@@ -529,6 +529,33 @@ describe("review submitter (entry wiring, R11)", () => {
 			assert.deepEqual(touched.filter((p) => p === "startChat" || p === "prompt" || p === "send"), []);
 			assert.ok(touched.includes("compose"));
 			assert.deepEqual(compose_calls.map((c) => Object.keys(c)), [["text"]]);
+		} finally {
+			globalThis.window = windowPrev;
+			resetStore();
+		}
+	});
+
+	it("marker POST failure → ok:true with markerAdvanced:false (delivery kept, honestly reported)", async () => {
+		const windowPrev = globalThis.window;
+		globalThis.window = { __piWebUiHost: { compose: () => true } };
+		try {
+			store.setSummary(SUMMARY);
+			store.setComment({ ...COMMENTS[0] });
+			const submitter = submitModule.createReviewSubmitter({
+				apiBase: "/plugins-api/git-review",
+				// /marker 返回 200 + {ok:false}（R13 阶梯）—— 推进失败必须如实上报
+				fetchImpl: async (url) => {
+					if (String(url).includes("/marker")) {
+						return { ok: true, status: 200, text: async () => JSON.stringify({ ok: false, error: "storage denied" }) };
+					}
+					return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, sha: SHA_HEAD }) };
+				},
+			});
+			const result = await submitter.submit({ review: REVIEW_OK, summary: SUMMARY, comments: store.getComments() });
+			assert.equal(result.ok, true);
+			assert.equal(result.markerAdvanced, false);
+			// 投递不回滚：草稿已清、消息已交
+			assert.deepEqual(store.getComments(), []);
 		} finally {
 			globalThis.window = windowPrev;
 			resetStore();

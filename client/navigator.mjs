@@ -302,7 +302,7 @@ export const NAVIGATOR_CSS = `
 	padding: 6px 10px; font-size: 11.5px; border-top: 1px solid var(--gr-border);
 	display: flex; align-items: baseline; gap: 6px; white-space: pre-line;
 }
-.gr-notice.error { color: var(--gr-amber); }
+.gr-notice.error, .gr-notice.noReview, .gr-notice.clipboardFailed { color: var(--gr-amber); }
 .gr-notice.done { color: var(--gr-green); }
 .gr-notice-text { flex: none; }
 .gr-notice-grow { flex: 1 1 auto; min-width: 0; }
@@ -786,7 +786,10 @@ export function createNavigator(opts = {}) {
 				summary: store.getSummary(),
 				comments: store.getComments(),
 			});
-			if (result.ok) {
+			if (result.ok && result.markerAdvanced === false) {
+				// 投递成功但 marker 没推进 —— 如实告知（下次评审仍从原基线开始），amber 警示。
+				uiNotice = { kind: "error", text: t("nav.submit.markerStale") };
+			} else if (result.ok) {
 				uiNotice = { kind: "done", text: t("nav.submit.done") };
 			} else if (result.reason === "empty") {
 				uiNotice = { kind: "empty", text: t("nav.submit.empty") };

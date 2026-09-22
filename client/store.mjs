@@ -335,7 +335,9 @@ export function assembleReviewMessage({ review, summary, comments } = {}) {
 
 	const files = Array.isArray(review?.files) ? review.files : [];
 	const total = Number(review?.total ?? files.length ?? 0);
-	if (review && total > 0) {
+	// 载荷截断时统一用已列文件数作 N（与 +A/−D 同源，避免「全量计数 + 截断求和」的混搭；README 记录）。
+	const count = review?.truncated ? files.length : total;
+	if (review && count > 0) {
 		const adds = files.reduce((sum, f) => sum + Number(f?.add ?? 0), 0);
 		const dels = files.reduce((sum, f) => sum + Number(f?.del ?? 0), 0);
 		const uncommitted = files.some((f) =>
@@ -344,7 +346,7 @@ export function assembleReviewMessage({ review, summary, comments } = {}) {
 		const baseSha = String(review?.base?.sha ?? "");
 		const headSha = String(review?.head?.sha ?? "");
 		sections.push(
-			`Code review (base ${ref}@${baseSha.slice(0, 7)} → HEAD@${headSha.slice(0, 7)}, ${total} files changed, +${adds}/−${dels}${uncommitted ? "; includes uncommitted changes" : ""})`,
+			`Code review (base ${ref}@${baseSha.slice(0, 7)} → HEAD@${headSha.slice(0, 7)}, ${count} files changed, +${adds}/−${dels}${uncommitted ? "; includes uncommitted changes" : ""})`,
 		);
 	}
 
