@@ -15,12 +15,16 @@
  *                             评审范围 = merge-base(base, HEAD) → 工作树 的 diff
  *                            （把未提交改动自动并入同一范围），untracked 来自并行
  *                             `git status --porcelain -uall`。
- *   GET  /diff?path=&base= → { ok, path, base:{ref,sha}, status, oldPath?, binary,
+ *   GET  /diff?path=&base=&context= → { ok, path, base:{ref,sha}, status, oldPath?, binary,
  *                              truncated, hunks:[{oldStart,oldLines,newStart,newLines,
  *                              lines:[{type:"ctx"|"add"|"del",old?,new?,text}]}] }
  *                          —— 状态/oldPath 从补丁自身文件头推导（rename from/to、
  *                             new/deleted file mode）；不用 pathspec 查 name-status，
  *                             因为 pathspec 会拆散 rename 检测（实测确认）。
+ *                             context 是 Phase 3 折叠空隙「点击展开」的可选参数：
+ *                             缺省（无参数）不加 -U（git 缺省 3 行，与 Phase 1 一致），
+ *                             给出则转成 -U<width> 重取更宽上下文（空隙变成 ctx 行，
+ *                             空隙收拢/两 hunk 合并），0..MAX_CONTEXT 外结构化报错。
  *   GET  /refs           → { ok, refs:[{name,current,remote?}] }（本地 + 远程跟踪）
  *   GET  /commits?limit= → { ok, commits:[{sha,shortSha,author,date,subject}] }
  *   GET  /marker         → { ok, sha: string|null, repoRoot }（每仓库根一个 key）
@@ -49,6 +53,7 @@ import {
 	parseStatusFiles,
 	parseUnifiedDiff,
 	parseLsFilesZ,
+	validateContext,
 	validateLimit,
 	validatePath,
 	validateRef,
@@ -277,9 +282,12 @@ async function treePayload(root) {
  * 实测确认）。所以先用**无 pathspec** 的 name-status 找到该文件的条目拿
  * status/oldPath，再把 old+new 两个路径一起放进 pathspec 重取补丁，让 rename 对
  * 成形、补丁锚定在新路径上。路径不在范围内 → ok + 零 hunk（客户端渲染空态）。 */
-async function diffPayload(host, root, rawBase, rawPath) {
+async function diffPayload(host, root, rawBase, rawPath, rawContext) {
 	const base = await resolveBase(host, root, rawBase);
 	const path = validatePath(String(rawPath ?? ""));
+	// Phase 3 折叠展开：宽度缺省 undefined = argv 不加 -U（与 Phase 1 逐字节一致）；
+	// 非法宽度在 validateContext 抛错 → withRepo 落 {ok:false,error}。
+	const context = validateContext(rawContext);
 	const headSha = await revParseCommit(root, "HEAD");
 	const mb = await mergeBaseWithHead(root, base.sha);
 	const nameStatusText = await git(root, [
@@ -310,7 +318,16 @@ async function diffPayload(host, root, rawBase, rawPath) {
 		};
 	}
 	const pathspecs = entry.oldPath !== undefined ? [entry.oldPath, path] : [path];
-	const raw = await git(root, ["diff", "--no-color", "--no-ext-diff", "--find-renames", mb, "--", ...pathspecs]);
+	const raw = await git(root, [
+		"diff",
+		"--no-color",
+		"--no-ext-diff",
+		"--find-renames",
+		...(context === undefined ? [] : [`-U${context}`]),
+		mb,
+		"--",
+		...pathspecs,
+	]);
 	// 超大 diff 的两级语义（R8/R16 × Phase 1 验收「oversized-diff → {ok:false,error}」）：
 	//   一级（本行）：原始补丁 ≤ 16MB 进程输出上限 → 正常返回，但超 MAX_PATCH_CHARS 时
 	//        capPatch 截尾并置 truncated:true —— 客户端渲染可见截断标记（R8），仍是完整可用结果。
@@ -371,7 +388,7 @@ export default {
 		}));
 
 		route("GET", "/diff", withRepo(async (root, req, res) => {
-			res.json(await diffPayload(host, root, req?.query?.base, req?.query?.path));
+			res.json(await diffPayload(host, root, req?.query?.base, req?.query?.path, req?.query?.context));
 		}));
 
 		route("GET", "/refs", withRepo(async (root, _req, res) => {

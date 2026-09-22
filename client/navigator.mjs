@@ -49,6 +49,25 @@ export function classifyReviewError(text) {
 	return "unknown";
 }
 
+/**
+ * R7：把主区切到本插件视图（宿主桥 `window.__piWebUiHost.setView("plugin:git-review")`，
+ * 桥契约 web/src/plugin-host.ts:283/512 —— setView(view: string): void，
+ * "plugin:<id>" 切到 App 的 pluginViews 面板）。桥缺失（占位测试 / 桥未就绪）时
+ * 安静降级返回 false，绝不抛错拖垮行点击。
+ */
+export function activateMainView(viewId = "plugin:git-review") {
+	try {
+		const bridge = globalThis.window?.__piWebUiHost;
+		if (bridge && typeof bridge.setView === "function") {
+			bridge.setView(viewId);
+			return true;
+		}
+	} catch {
+		/* 桥不可用 → no-op */
+	}
+	return false;
+}
+
 /** rename 展示文案：`oldPath → path`；非 rename 返回 null。 */
 export function renameText(file) {
 	return file && typeof file.oldPath === "string" && file.oldPath !== "" ? `${file.oldPath} → ${file.path}` : null;
@@ -470,8 +489,11 @@ export function createNavigator(opts = {}) {
 				row.append(el("span", { class: `gr-flag${isUntracked ? " untracked" : ""}`, text: label }));
 			}
 			row.addEventListener("click", () => {
-				// 选中进共享 store（Phase 3 在此处接 setView("plugin:git-review")）。
-				store.setState({ selectedPath: file.path });
+				// R7：选中进共享 store（{path, base} 原子写入 —— viewer 对任一变化重拉
+				// /diff），并把主区切到插件视图（R7；桥不可用时安静降级 no-op）。
+				const override = store.getState().baseOverride;
+				store.setSelection({ path: file.path, base: override?.ref ?? review?.base?.ref ?? null });
+				activateMainView();
 			});
 		} else {
 			main.append(el("div", { class: "gr-name", text: name }));
@@ -724,6 +746,14 @@ export function createNavigator(opts = {}) {
 			if (reviewRes?.ok) {
 				review = reviewRes;
 				store.setLastReview(reviewRes);
+				// 活动基线已解析 → 把共享选中同步到同一基线（R15 store 联动：viewer 据
+				// selectedPath+selectedBase 拉 /diff，评审基线变化时必须跟着重拉。同步点
+				// 放在 /review 返回后 —— 覆盖刚落但解析失败时 viewer 保留旧基线，与
+				// 导航的错误态一致）。值未变时 setSelection 不通知，viewer 不重拉。
+				const selectedPath = store.getState().selectedPath;
+				if (typeof selectedPath === "string" && selectedPath !== "") {
+					store.setSelection({ path: selectedPath, base: reviewRes.base?.ref ?? null });
+				}
 			} else {
 				review = null;
 				errorText = reviewRes?.error ?? "unknown error";

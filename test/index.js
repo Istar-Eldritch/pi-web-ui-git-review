@@ -11,6 +11,7 @@
 	await import("./server-smoke.test.mjs");
 	await import("./tree-route.test.mjs");
 	await import("./navigator.test.mjs");
+	await import("./viewer.test.mjs");
 })().catch((err) => {
 	console.error(err);
 	process.exitCode = 1;

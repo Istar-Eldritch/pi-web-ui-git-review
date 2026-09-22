@@ -88,6 +88,23 @@ export function validateLimit(value, { fallback = DEFAULT_COMMIT_LIMIT, max = MA
 	return n;
 }
 
+/** /diff 上下文宽度上限（validateContext 同口径；可展开折叠空隙的 -U 宽度重取
+ *  也封在这里 —— 客户端增长常量与服务端校验共用一个源头）。 */
+export const MAX_CONTEXT = 1000;
+
+/**
+ * 校验 /diff 的 context 宽度（R8 折叠空隙「点击展开」的取数参数，路由转成
+ * `git diff -U<width>`）：无参数/空串 → undefined（argv 不加 -U，git 缺省 3 行
+ * 上下文 —— 缺省行为与 Phase 1 完全一致）；给出但非整数或 0..MAX_CONTEXT 外 →
+ * 抛错（路由落 {ok:false,error}，R13/R14 同一条严格口径）。
+ */
+export function validateContext(value) {
+	if (value === undefined || value === null || String(value).trim() === "") return undefined;
+	const n = Number(value);
+	if (!Number.isInteger(n) || n < 0 || n > MAX_CONTEXT) throw new Error(`invalid context: ${JSON.stringify(value)}`);
+	return n;
+}
+
 /* ------------------------------------------------------------------ */
 /* 解析器（镜像宿主 server/scm.ts）                                     */
 /* ------------------------------------------------------------------ */

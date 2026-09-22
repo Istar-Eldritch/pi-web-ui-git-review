@@ -29,6 +29,10 @@ function localStorageOrNull() {
 const state = {
 	/** 导航里选中的文件（/review.files[].path）—— viewer 据此拉 /diff。 */
 	selectedPath: null,
+	/** 选中携带的基线 ref（/diff?base= 的参数；null = 服务端缺省解析）。与
+	 *  selectedPath 由 setSelection() 原子写入：评审基线变化时 navigator 会把
+	 *  选中重新同步到新基线，viewer 据此也重拉 /diff（R7/R15 的 store 联动）。 */
+	selectedBase: null,
 	/**
 	 * 本次会话的基线覆盖（R5）；null = 跟随存储的 marker。形态 { ref, source }，
 	 * source 记用户选择的类别（"branch" | "commit" | "manual"）。
@@ -101,6 +105,22 @@ export function setBaseOverride(override) {
 			: { ref: String(override.ref ?? ""), source: String(override.source ?? "override") };
 	notify();
 	return state.baseOverride;
+}
+
+/**
+ * 共享选中（R7/R15）：{ path, base } 原子写入 selectedPath/selectedBase —— 选中
+ * 携带基线，viewer 对两者任一变化都重拉 /diff。null（或空 path）= 清除选中。
+ * 值完全不变时**不通知**（另一 mount 的无关重渲染/重拉都省掉）。基线为空串 /
+ * 非字符串一律归一化为 null（= 服务端缺省解析，与 ?base= 省略同义）。
+ */
+export function setSelection(selection) {
+	const path = selection && typeof selection.path === "string" && selection.path !== "" ? selection.path : null;
+	const base = selection && typeof selection.base === "string" && selection.base !== "" ? selection.base : null;
+	if (path === state.selectedPath && base === (state.selectedBase ?? null)) return state;
+	state.selectedPath = path;
+	state.selectedBase = base;
+	notify();
+	return state;
 }
 
 /** 记录最近一次 /review 载荷（Phase 1 契约形态）；viewer 跨 tab 复用。 */

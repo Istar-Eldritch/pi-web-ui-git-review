@@ -408,6 +408,90 @@ describe("GET /diff", () => {
 	});
 });
 
+describe("GET /diff — context width (phase-3 fold expansion)", () => {
+	/** 折叠展开的取数参数：40 行文件在第 5/30 行各改一处 → 默认 -U3 两个 hunk
+	 *  （空隙 old 9..26 共 18 行未变更）；-U24 时空隙完全闭合、两 hunk 合并。 */
+	function patchworkRepo() {
+		const { root, g } = makeScratchRepo("git-review-ctx-");
+		writeFileSync(join(root, "patchwork.txt"), lines("base", 40));
+		g(["add", "-A"]);
+		g(["commit", "-q", "-m", "base"]);
+		const baseSha = g(["rev-parse", "HEAD"]).trim();
+		// 未提交改两处（base=baseSha → merge-base(baseSha, HEAD)=baseSha → diff baseSha→工作树）
+		writeFileSync(
+			join(root, "patchwork.txt"),
+			lines("base", 40).replace("line 4 base", "line 4 edited").replace("line 29 base", "line 29 edited"),
+		);
+		return { root, g, baseSha };
+	}
+
+	it("default width: two hunks with an elided gap of 18 unchanged lines (git -U3 semantics)", async () => {
+		const { root, baseSha } = patchworkRepo();
+		try {
+			const out = await callRoute(freshHost({ cwd: root }), "GET", "/diff", { query: { path: "patchwork.txt", base: baseSha } });
+			assert.equal(out.ok, true);
+			assert.deepEqual(out.hunks.map((h) => [h.oldStart, h.oldLines, h.newStart, h.newLines]), [
+				[2, 7, 2, 7],
+				[27, 7, 27, 7],
+			]);
+			// 空隙行（old 9..26）不出现 —— 折叠空隙正是 viewer 折叠行展示的「⋯ 18 行未变更」
+			const olds = out.hunks.flatMap((h) => h.lines.filter((l) => l.type !== "add").map((l) => l.old));
+			for (const no of [9, 15, 26]) assert.ok(!olds.includes(no), `gap line ${no} must stay elided at default width`);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("context=24 (-U24): gap closes into ctx rows with continuous old/new numbers, hunks merge", async () => {
+		const { root, baseSha } = patchworkRepo();
+		try {
+			const out = await callRoute(freshHost({ cwd: root }), "GET", "/diff", {
+				query: { path: "patchwork.txt", base: baseSha, context: "24" },
+			});
+			assert.equal(out.ok, true);
+			assert.equal(out.hunks.length, 1);
+			assert.deepEqual([out.hunks[0].oldStart, out.hunks[0].oldLines], [1, 40]);
+			const ctx = out.hunks[0].lines.filter((l) => l.type === "ctx");
+			// 空隙行 old 9..26 全部以 ctx 呈现，old/new 行号连续且对齐
+			for (const no of [9, 15, 26]) {
+				assert.ok(ctx.some((l) => l.old === no && l.new === no), `ctx row for gap line ${no} must appear`);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("context=0 (-U0): zero context, count-omitted hunk headers normalize to 1", async () => {
+		const { root, baseSha } = patchworkRepo();
+		try {
+			const out = await callRoute(freshHost({ cwd: root }), "GET", "/diff", {
+				query: { path: "patchwork.txt", base: baseSha, context: "0" },
+			});
+			assert.equal(out.ok, true);
+			assert.deepEqual(out.hunks.map((h) => [h.oldStart, h.oldLines, h.newStart, h.newLines]), [
+				[5, 1, 5, 1],
+				[30, 1, 30, 1],
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("invalid context widths are structured errors (R13/R14 strictness)", async () => {
+		const { root, baseSha } = patchworkRepo();
+		try {
+			const host = freshHost({ cwd: root });
+			for (const bad of ["abc", "-5", "1.5", "1001"]) {
+				const out = await callRoute(host, "GET", "/diff", { query: { path: "patchwork.txt", base: baseSha, context: bad } });
+				assert.equal(out.ok, false, `context=${bad}`);
+				assert.match(out.error, /invalid context/);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("truncation caps (R16 / oversized-diff two-tier semantics)", () => {
 	it("/diff: patch over MAX_PATCH_CHARS → truncated:true with hunks still parsed (tier 1)", async () => {
 		const { root, g } = makeScratchRepo("git-review-trunc-");

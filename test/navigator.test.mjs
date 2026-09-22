@@ -8,155 +8,28 @@
  *      驱动：行渲染、两个开关 + localStorage 持久化、基线选择器（分支/提交/手动）、
  *      状态机（空评审、截断、非仓库、stale marker、无基线、通用错误）、清理。
  *
- * 全局桩次序：localStorage 桩在任何被测模块装载**之前**装上（store 的持久化
- * 每次调用时再判 localStorage，所以本文件动态 import 即可拿到带桩的行为）。
+ * 全局桩次序：假环境收口在 test/fake-env.mjs（与 viewer 套件共享同一份 ——
+ * 两个套件被 test/index.js import 进**同一进程**，各装一份全局桩会互相打掉，
+ * 正是「单独跑全绿、全量跑必挂」的跨套件污染）。桩在任何被测模块装载之前
+ * 安装（store 的持久化每次调用时再判 localStorage，装好即对后续行为生效）。
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 /* ------------------------------------------------------------------ */
-/* 全局桩（先于被测模块）                                                */
+/* 全局桩（先于被测模块；与 viewer 套件共享 —— 见 fake-env.mjs 头注释）     */
 /* ------------------------------------------------------------------ */
 
-const localStorageBag = new Map();
-globalThis.localStorage = {
-	getItem: (key) => (localStorageBag.has(key) ? localStorageBag.get(key) : null),
-	setItem: (key, value) => localStorageBag.set(key, String(value)),
-	removeItem: (key) => localStorageBag.delete(key),
-};
+import { collect, createBridgeSpy, FakeDocument, installGlobalStubs, localStorageBag } from "./fake-env.mjs";
+installGlobalStubs();
 
 const store = await import("../client/store.mjs");
 const navModule = await import("../client/navigator.mjs");
 const i18n = await import("../client/i18n.mjs");
 
 /* ------------------------------------------------------------------ */
-/* 极小假 DOM                                                           */
+/* 断言辅助（假 DOM 与 collect 来自 fake-env.mjs）                        */
 /* ------------------------------------------------------------------ */
-
-class FakeElement {
-	constructor(tag) {
-		this.tagName = String(tag).toUpperCase();
-		this.childNodes = [];
-		this.parentNode = null;
-		this._classes = new Set();
-		this.dataset = {};
-		this._attributes = {};
-		this._listeners = new Map();
-		this.style = { cssText: "" };
-		this._value = "";
-	}
-
-	get classList() {
-		const classes = this._classes;
-		return {
-			add: (...names) => names.forEach((name) => classes.add(name)),
-			remove: (...names) => names.forEach((name) => classes.delete(name)),
-			toggle: (name, force) => {
-				const on = force === undefined ? !classes.has(name) : Boolean(force);
-				if (on) classes.add(name);
-				else classes.delete(name);
-				return on;
-			},
-			contains: (name) => classes.has(name),
-		};
-	}
-
-	get className() {
-		return [...this._classes].join(" ");
-	}
-
-	set className(value) {
-		this._classes = new Set(String(value).split(/\s+/).filter(Boolean));
-	}
-
-	get textContent() {
-		return this.childNodes.map((child) => (typeof child === "string" ? child : child.textContent)).join("");
-	}
-
-	set textContent(value) {
-		for (const child of this.childNodes) {
-			if (typeof child !== "string") child.parentNode = null;
-		}
-		this.childNodes = value == null ? [] : [String(value)];
-	}
-
-	append(...nodes) {
-		for (const node of nodes) {
-			if (node === undefined || node === null || node === false) continue;
-			if (typeof node === "string" || typeof node === "number") {
-				this.childNodes.push(String(node));
-				continue;
-			}
-			if (node.parentNode) node.remove();
-			node.parentNode = this;
-			this.childNodes.push(node);
-		}
-	}
-
-	remove() {
-		if (!this.parentNode) return;
-		const index = this.parentNode.childNodes.indexOf(this);
-		if (index >= 0) this.parentNode.childNodes.splice(index, 1);
-		this.parentNode = null;
-	}
-
-	setAttribute(name, value) {
-		this._attributes[name] = String(value);
-	}
-
-	getAttribute(name) {
-		return this._attributes[name] ?? null;
-	}
-
-	addEventListener(type, handler) {
-		let handlers = this._listeners.get(type);
-		if (!handlers) {
-			handlers = new Set();
-			this._listeners.set(type, handlers);
-		}
-		handlers.add(handler);
-	}
-
-	dispatch(type) {
-		for (const handler of [...(this._listeners.get(type) ?? [])]) {
-			handler({ type, target: this, preventDefault() {} });
-		}
-	}
-
-	click() {
-		this.dispatch("click");
-	}
-
-	get value() {
-		return this._value;
-	}
-
-	set value(value) {
-		this._value = String(value);
-	}
-}
-
-class FakeDocument {
-	constructor() {
-		this.head = new FakeElement("head");
-	}
-
-	createElement(tag) {
-		return new FakeElement(tag);
-	}
-}
-
-/* ------------------------------------------------------------------ */
-/* 断言辅助                                                             */
-/* ------------------------------------------------------------------ */
-
-function collect(node, className, into = []) {
-	if (node?.classList?.contains?.(className)) into.push(node);
-	for (const child of node?.childNodes ?? []) {
-		if (typeof child !== "string") collect(child, className, into);
-	}
-	return into;
-}
 
 function rowsOf(root) {
 	return collect(root, "gr-row").map((row) => ({ el: row, path: row.dataset.path, text: row.textContent }));
@@ -754,32 +627,25 @@ describe("navigator locale and lifecycle", () => {
 
 	it("follows the onLocale payload even while documentElement.lang is stale (R12)", async () => {
 		resetStore();
-		let deliverLocale = null;
+		const bridge = createBridgeSpy();
 		const previousWindow = globalThis.window;
 		const previousDocument = globalThis.document;
 		try {
 			// 模拟宿主时序：LanguageProvider（App 的父级）写属性的 effect 还没跑，
 			// onLocale 触发瞬间 documentElement.lang 仍是旧值 —— 切语言必须靠载荷。
 			globalThis.document = { documentElement: { lang: "zh-CN" } };
-			globalThis.window = {
-				__piWebUiHost: {
-					onLocale: (handler) => {
-						deliverLocale = handler;
-						return () => {};
-					},
-				},
-			};
+			globalThis.window = { __piWebUiHost: bridge.host };
 			const { view } = await mountNavigator(standardRoutes());
 			assert.equal(view.lang, "zh");
-			assert.ok(deliverLocale, "navigator must subscribe via onLocale");
+			assert.ok(bridge.hasLocaleSubscriber(), "navigator must subscribe via onLocale");
 			assert.equal(globalThis.document.documentElement.lang, "zh-CN"); // 属性确实保持旧值
 
-			deliverLocale("en-US");
+			bridge.deliverLocale("en-US");
 			assert.equal(view.lang, "en");
 			assert.equal(view.model.els.refreshBtn.textContent, "Refresh");
 			assert.equal(view.model.els.baseBadge.textContent, "marker");
 
-			deliverLocale("zh-CN");
+			bridge.deliverLocale("zh-CN");
 			assert.equal(view.lang, "zh");
 			assert.equal(view.model.els.refreshBtn.textContent, "刷新");
 			assert.equal(view.model.els.baseBadge.textContent, "标记");
