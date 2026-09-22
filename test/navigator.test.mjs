@@ -174,6 +174,9 @@ describe("navigator pure helpers", () => {
 		assert.equal(navModule.classifyReviewError("no review base: no stored marker and none of origin/HEAD, origin/main, origin/master, main, master resolves — pass ?base="), "no-base");
 		// 覆盖用的 base 解析失败（分支被删）→ 同一条「手动选基线」恢复路径
 		assert.equal(navModule.classifyReviewError("unknown base: ghost"), "no-base");
+		// unrelated histories：merge-base 失败也归类 no-base（服务端 rethrow 同前缀，
+		// 指向手动选基线而不是 unknown + 永远失败的 Retry）
+		assert.equal(navModule.classifyReviewError("unknown base: f00d — no common ancestor with HEAD (git command failed)"), "no-base");
 		assert.equal(navModule.classifyReviewError(undefined), "unknown");
 	});
 

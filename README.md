@@ -61,6 +61,8 @@ Please fix the raised comments and re-commit.
 
 - **范围头**在无变更时整个省略；`; includes uncommitted changes` 只在文件带 staged / unstaged / untracked 标记时带上
   （未跟踪也是未提交的工作树差异）；`N/+A/−D` 按载荷 files 求和（载荷截断时是已列文件的和）。
+  同理，「includes uncommitted changes」注记也按已列文件的标记判定 —— 极端情形下
+  （未提交文件全部排在截断线之后）注记可能省略。
 - **General 节**空摘要时省略；**Comments 节**无评论时省略；全空提交被守卫拦下（可见通知，不产生空消息）。
 - **评论编号顺序** = 路径字典序 → 文件级在前 → 行号升 → old 在 new 前；与评论列表/提交编号同源，看到的顺序 = 提交后的编号。
 - **侧注记**：old 侧一律带 `(old side)`；本构建对 new 侧也一律带 `(new side)`（契约允许「无歧义的新侧省略」，本构建不行使该省略）。

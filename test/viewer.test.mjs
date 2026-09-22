@@ -273,15 +273,17 @@ function createStubServer(extraRoutes = {}) {
 		const anchor = all.lastIndexOf("/plugins-api/git-review");
 		const route = anchor >= 0 ? all.slice(anchor + "/plugins-api/git-review".length) : all;
 		const query = Object.fromEntries(parsed.searchParams);
-		calls.push({ method: init?.method ?? "GET", route, query });
+		const reqBody = init?.body ? JSON.parse(init.body) : undefined;
+		calls.push({ method: init?.method ?? "GET", route, query, body: reqBody });
 		// /diff 的路由表按**文件路径**键入（diffRoutesFor），按 query.path 解析；
-		// extraRoutes 仍可直接以 "/diff" 为键覆盖（错误注入用）。
+		// extraRoutes 仍可直接以 "/diff" 为键覆盖（错误注入用）。函数路由可再收
+		// 第二参 body（POST /marker 的断言用；既有单参函数不受影响）。
 		const respond = routes[route] ?? (route === "/diff" ? routes[query.path] : undefined);
 		if (!respond) {
 			const body = { ok: false, error: `no stub route: ${route}` };
 			return { ok: false, status: 404, text: async () => JSON.stringify(body) };
 		}
-		const body = typeof respond === "function" ? await respond(query) : respond;
+		const body = typeof respond === "function" ? await respond(query, reqBody) : respond;
 		return { ok: true, status: 200, text: async () => JSON.stringify(body) };
 	};
 	return { fetchImpl, calls };
@@ -648,6 +650,21 @@ describe("viewer fold expand/collapse", () => {
 		view.expandFolds();
 		await tick();
 		assert.equal(server.calls.length, callsAtCap, "no refetch once pinned at MAX_CONTEXT");
+		view.destroy();
+	});
+
+	it("path change closes a foreign file-level editor (input must not misfile into the previous file)", async () => {
+		const { view } = await mountViewer("src/app.ts");
+		// 文件级编辑器（header 按钮，非选中来源）锚着 src/app.ts
+		view.model.els.fileCommentBtn.click();
+		await tick();
+		assert.equal(collect(view.root, "gr-veditor-label")[0].textContent, "src/app.ts (file-level)");
+		// 导航侧点击另一文件 → 换文件分支必须收起旧文件的编辑器
+		store.setSelection({ path: "feature.txt", base: "main" });
+		await assertEventually(
+			() => collect(view.root, "gr-veditor-label").length === 0 && store.getState().selectedPath === "feature.txt",
+			"foreign editor must close on path change",
+		);
 		view.destroy();
 	});
 
@@ -1236,6 +1253,46 @@ describe("viewer lifecycle and cleanup symmetry (R15)", () => {
 		}
 	});
 
+	it("cwd-changed broadcast clears the selection back to the R7 empty state (viewer ctx.onData)", async () => {
+		const dataCbs = [];
+		let offCalled = false;
+		const ctx = {
+			onData: (cb) => {
+				dataCbs.push(cb);
+				return () => {
+					offCalled = true;
+				};
+			},
+		};
+		resetStore();
+		store.setSelection({ path: "src/app.ts", base: "main" });
+		const server = createStubServer();
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+			ctx,
+		});
+		await view.refresh();
+		assert.ok(lineRowsOf(view.root).length > 0, "precondition: diff rendered");
+
+		// 工作区切换广播 → 清共享选中 → store 通知驱动回落 R7 空态（不发旧仓库的 /diff）
+		const callsBefore = server.calls.length;
+		for (const cb of dataCbs) cb({ kind: "cwd-changed" });
+		await assertEventually(
+			() => lineRowsOf(view.root).length === 0 && collect(view.root, "gr-vstate").some((box) => box.textContent.includes("主区 diff 查看器")),
+			"viewer must fall back to the empty state after a workspace switch",
+		);
+		assert.equal(store.getState().selectedPath, null);
+		assert.equal(server.calls.length, callsBefore, "no /diff refetch against the old workspace");
+
+		// 与 navigator 侧对称：注销在 destroy 里收尾
+		assert.equal(offCalled, false);
+		view.destroy();
+		assert.equal(offCalled, true);
+	});
+
 	it("activateMainView calls the real bridge contract setView(view: string) — void return, 'plugin:<id>' id", async () => {
 		const previousWindow = globalThis.window;
 		const calls = [];
@@ -1247,6 +1304,82 @@ describe("viewer lifecycle and cleanup symmetry (R15)", () => {
 			assert.deepEqual(calls, ["plugin:git-review", "plugin:other"]);
 		} finally {
 			globalThis.window = previousWindow;
+		}
+	});
+
+	it("full journey: navigator click → viewer renders → draft → submit → compose → marker POST → drafts cleared → post-submit refresh", async () => {
+		resetStore();
+		const markerBodies = [];
+		const composeCalls = [];
+		const server = createStubServer({
+			...standardRoutes(),
+			// POST /marker 记录 body（函数路由第二参）；GET 仍回静态形态
+			"/marker": (_query, body) => {
+				if (body?.sha) {
+					markerBodies.push(body);
+					return { ok: true, sha: body.sha };
+				}
+				return { ok: true, sha: SHA_MARKER, repoRoot: "/repo" };
+			},
+		});
+		const setViews = [];
+		const previousFetch = globalThis.fetch;
+		const previousDocument = globalThis.document;
+		const previousWindow = globalThis.window;
+		globalThis.fetch = server.fetchImpl;
+		globalThis.document = new FakeDocument();
+		globalThis.window = {
+			__piWebUiHost: {
+				setView: (view) => setViews.push(view),
+				compose: (payload) => {
+					composeCalls.push(payload);
+					return true;
+				},
+			},
+		};
+		try {
+			const navHost = new FakeElement("div");
+			navHost.classList.add("plugin-page-host");
+			const viewHost = new FakeElement("div");
+			const cleanupNav = entry.mount(navHost, {});
+			const cleanupView = entry.mount(viewHost, {});
+			await assertEventually(() => collect(navHost, "gr-row").length === REVIEW_FILES.length, "navigator rows must render");
+
+			// ① 导航点击 → 主区渲染同一文件（R7/R15 联动）
+			const row = collect(navHost, "gr-row").find((el) => el.dataset.path === "src/app.ts");
+			row.click();
+			assert.deepEqual(setViews, ["plugin:git-review"]);
+			await assertEventually(() => lineRowsOf(viewHost).length === 9, "viewer must render the clicked file's diff");
+
+			// ② 草稿（编辑器 UI 由各自套件覆盖，这里走 store 接缝）
+			store.setComment({ path: "src/app.ts", side: "new", start: 2, end: 2, text: "explain" });
+			store.setSummary("Overall: naming follows repo convention.");
+			await tick();
+
+			// ③ 导航提交按钮 → 整条链收尾（compose → marker POST → 清草稿）
+			const submitBtn = collect(navHost, "gr-submit")[0];
+			assert.ok(submitBtn, "navigator submit button must render");
+			submitBtn.click();
+			await assertEventually(
+				() => composeCalls.length === 1 && markerBodies.length === 1 && store.getComments().length === 0 && store.getSummary() === "",
+				"full submit chain must complete",
+			);
+			assert.equal(markerBodies[0].sha, SHA_HEAD, "marker POST carries the /review-resolved HEAD");
+			assert.ok(composeCalls[0].text.includes("Code review (base main@"));
+			assert.ok(composeCalls[0].text.includes("1. src/app.ts:2 (new side): explain"));
+			assert.ok(composeCalls[0].text.includes("Please fix the raised comments and re-commit."));
+			assert.deepEqual(store.getState().baseOverride, null, "post-submit refresh runs on the marker range (override-free)");
+
+			// ④ 提交后导航刷新（第二次 /review）+ 成功通知
+			assert.ok(server.calls.filter((call) => call.route === "/review").length >= 2, "navigator must refresh after submit");
+			assert.ok(collect(navHost, "gr-notice").some((n) => n.textContent.includes("评审已投递为草稿")));
+			assert.doesNotThrow(() => cleanupNav());
+			assert.doesNotThrow(() => cleanupView());
+		} finally {
+			globalThis.fetch = previousFetch;
+			globalThis.document = previousDocument;
+			globalThis.window = previousWindow;
+			store.setSelection(null);
 		}
 	});
 });

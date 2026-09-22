@@ -832,6 +832,14 @@ export function createViewer(opts = {}) {
 			}
 			return;
 		}
+		// 换文件：锚着旧文件的编辑器一律收起 —— 文件级编辑器不属于选中
+		// （否则 A 的编辑器悬在 B 的 diff 上方，输入会误存成 A 的评论）。
+		if (editorAnchor && editorAnchor.path !== path) {
+			editorAnchor = null;
+			editorText = "";
+			editorFromSelection = false;
+			syncEditorSlot();
+		}
 		resetSelection();
 		mountedPath = path;
 		mountedBase = base;
@@ -844,6 +852,15 @@ export function createViewer(opts = {}) {
 		const next = localeToLang(loc);
 		if (next !== lang) setLang(next);
 	});
+
+	// 服务端 cwd-changed 广播（Phase 1 onCwdChange）→ 工作区变了：清共享选中，
+	// 经 store 通知回落到 R7 空态（导航侧有自己的 onData 重拉，两侧对称）。
+	let offData = null;
+	if (typeof opts.ctx?.onData === "function") {
+		offData = opts.ctx.onData((payload) => {
+			if (payload && payload.kind === "cwd-changed" && !destroyed) store.setSelection(null);
+		});
+	}
 
 	function setLang(next) {
 		lang = next === "en" || next === "zh" ? next : detectLang();
@@ -877,6 +894,11 @@ export function createViewer(opts = {}) {
 			}
 			try {
 				offLocale?.();
+			} catch {
+				/* ignore */
+			}
+			try {
+				offData?.();
 			} catch {
 				/* ignore */
 			}

@@ -134,8 +134,16 @@ async function revParseCommit(root, ref) {
 	return sha;
 }
 
-async function mergeBaseWithHead(root, baseSha) {
-	const out = await git(root, ["merge-base", baseSha, "HEAD"]);
+async function mergeBaseWithHead(root, baseSha, ref = "") {
+	let out;
+	try {
+		out = await git(root, ["merge-base", baseSha, "HEAD"]);
+	} catch (e) {
+		// merge-base 失败（最典型：unrelated histories，exit 1）→ 归类 no-base：
+		// 客户端 classifyReviewError 把「unknown base」路由到手动选基线的恢复路径，
+		// 而不是 unknown + 永远失败的 Retry。保留底层报错细节供排查。
+		throw new Error(`unknown base: ${ref || baseSha} — no common ancestor with HEAD (${e.message})`);
+	}
 	const sha = out.trim();
 	if (!/^[0-9a-f]{40,64}$/.test(sha)) throw new Error("merge-base failed");
 	return sha;
@@ -201,7 +209,7 @@ function flagsFor(statusEntry) {
 /** /review：merge-base(base, HEAD) → 工作树 的变更清单 + untracked 并入。 */
 async function reviewPayload(host, root, rawBase) {
 	const base = await resolveBase(host, root, rawBase);
-	const mb = await mergeBaseWithHead(root, base.sha);
+	const mb = await mergeBaseWithHead(root, base.sha, base.ref);
 	const headSha = await revParseCommit(root, "HEAD");
 	const [nameStatusText, numstatText, statusText] = await Promise.all([
 		git(root, ["diff", "--no-color", "--no-ext-diff", "--find-renames", "--name-status", mb]),
@@ -289,7 +297,7 @@ async function diffPayload(host, root, rawBase, rawPath, rawContext) {
 	// 非法宽度在 validateContext 抛错 → withRepo 落 {ok:false,error}。
 	const context = validateContext(rawContext);
 	const headSha = await revParseCommit(root, "HEAD");
-	const mb = await mergeBaseWithHead(root, base.sha);
+	const mb = await mergeBaseWithHead(root, base.sha, base.ref);
 	const nameStatusText = await git(root, [
 		"diff",
 		"--no-color",

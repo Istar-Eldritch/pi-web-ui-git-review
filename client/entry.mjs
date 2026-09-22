@@ -77,6 +77,8 @@ export default {
 		const viewer = createViewer({
 			apiBase: apiBaseFromUrl(import.meta.url),
 			document: el.ownerDocument ?? globalThis.document,
+			// onData 收 cwd-changed 广播 → 清选中回 R7 空态（与 navigator 侧对称，R15）。
+			ctx,
 		});
 		el.appendChild(viewer.root);
 		void viewer.refresh();

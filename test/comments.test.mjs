@@ -745,6 +745,8 @@ describe("navigator submit flow (R11)", () => {
 			} },
 		});
 		try {
+			// 会话内基线覆盖（picker 之前选过 dev）—— marker 推进成功后必须失效
+			store.setBaseOverride({ ref: "dev", source: "branch" });
 			// 写草稿（viewer 编辑器保存后的 store 形态）
 			store.setSummary("Overall: the naming follows repo convention.");
 			store.setComment({ path: "feature.txt", side: "new", start: 1, end: 2, text: "explain" });
@@ -779,6 +781,9 @@ describe("navigator submit flow (R11)", () => {
 			assert.deepEqual(store.getComments(), []);
 			assert.equal(store.getSummary(), "");
 			assert.ok(noticesOf(view.root).some((notice) => notice.kind === "done"));
+			// marker 推进成功 → 会话内覆盖立即失效（post-submit 刷新直接落 marker 范围，
+			// 同一批文件不被重复列出、重复可评）
+			assert.equal(store.getState().baseOverride, null);
 			// 基线展示推进到提交后的 marker（桩 /review base=marker → main@c123456）——
 			// fresh navigator 缺省 = post-submit 范围（R4/R11 闭环）
 			await assertEventually(

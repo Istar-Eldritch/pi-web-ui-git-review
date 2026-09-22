@@ -679,7 +679,7 @@ export function createNavigator(opts = {}) {
 	}
 
 	function renderFullTree() {
-		if (treeLoading) return stateBox(t("nav.refreshing"), null);
+		if (treeLoading) return stateBox(t("nav.state.refreshing"), null);
 		if (treeError) {
 			return stateBox(t("nav.state.fullError", { e: treeError }), null, [
 				(model.els.retryTreeBtn = el("button", { class: "gr-btn", text: t("nav.state.retry"), onclick: () => {
@@ -788,8 +788,12 @@ export function createNavigator(opts = {}) {
 			});
 			if (result.ok && result.markerAdvanced === false) {
 				// 投递成功但 marker 没推进 —— 如实告知（下次评审仍从原基线开始），amber 警示。
+				// 覆盖保持不动：原基线仍是当前真实范围。
 				uiNotice = { kind: "error", text: t("nav.submit.markerStale") };
 			} else if (result.ok) {
+				// marker 已推进到 HEAD —— 会话内覆盖立即失效，本次刷新直接落在
+				// post-submit 范围（否则同一批文件被重复列出、重复可评）。
+				store.setBaseOverride(null);
 				uiNotice = { kind: "done", text: t("nav.submit.done") };
 			} else if (result.reason === "empty") {
 				uiNotice = { kind: "empty", text: t("nav.submit.empty") };

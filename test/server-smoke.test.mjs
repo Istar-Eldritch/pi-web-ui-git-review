@@ -314,6 +314,28 @@ describe("GET /review", () => {
 		assert.doesNotMatch(out.error, /no longer exists|stale review marker/);
 	});
 
+	it("unrelated-histories base (merge-base fails) → no-base-classified error, not a retry loop", async () => {
+		const repo2 = makeScratchRepo("gr-orphan-");
+		writeFileSync(join(repo2.root, "base.txt"), "base\n");
+		repo2.g(["add", "."]);
+		repo2.g(["commit", "-q", "-m", "base"]);
+		// 无父根提交（--orphan 保留 index：先清掉 base.txt 的暂存）
+		repo2.g(["checkout", "-q", "--orphan", "isolated"]);
+		rmSync(join(repo2.root, "base.txt"));
+		repo2.g(["rm", "-q", "--cached", "base.txt"]);
+		writeFileSync(join(repo2.root, "orphan.txt"), "orphan root\n");
+		repo2.g(["add", "."]);
+		repo2.g(["commit", "-q", "-m", "orphan root"]);
+		const orphanSha = repo2.g(["rev-parse", "isolated"]).trim();
+		repo2.g(["checkout", "-q", "main"]); // HEAD 存在且与 isolated 无共同祖先
+		const host = freshHost({ cwd: repo2.root });
+		const out = await callRoute(host, "GET", "/review", { query: { base: orphanSha } });
+		assert.equal(out.ok, false);
+		// 前缀可被 classifyReviewError 归为 no-base（→ 手动选基线恢复路径）
+		assert.match(out.error, /unknown base/);
+		assert.match(out.error, /no common ancestor/);
+	});
+
 	it("rejects injected-looking bases without running them (R14)", async () => {
 		const host = freshHost();
 		for (const bad of ["-x", "--", "a\nb", "a b"]) {
