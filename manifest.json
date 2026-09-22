@@ -1,0 +1,22 @@
+{
+	"id": "git-review",
+	"name": "Diff 评审",
+	"version": "0.1.0",
+	"icon": "🔀",
+	"description": "代码评审：右栏导航列出相对评审基线（merge-base 语义，含未提交与未跟踪改动）的全部变更文件，主区渲染统一 diff（旧/新行号、可折叠空隙、二进制占位），支持行级评论并在提交时把整篇评审作为草稿放进聊天输入框（不自动发送）。",
+	"descriptionEn": "Code review: a right-panel navigator lists every file changed relative to the review base (merge-base semantics, uncommitted and untracked changes folded in), the main area renders a unified diff (old/new line numbers, foldable gaps, binary placeholder), and line-anchored comments assemble into a review draft placed in the chat input on submit (never auto-sent).",
+	"apiVersion": 2,
+	"view": true,
+	"permissions": ["ui", "http"],
+	"ui": {
+		"rightpanel": [
+			{
+				"id": "navigator",
+				"label": "Diff 评审",
+				"labelEn": "Diff Review",
+				"icon": "🔀",
+				"kind": "view"
+			}
+		]
+	}
+}
