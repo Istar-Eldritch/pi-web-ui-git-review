@@ -20,9 +20,12 @@
  * 变化重拉）。无选中 → R7 空态提示指向右栏导航。导航侧的文件点击（navigator.mjs
  * row click）写选中 + 经宿主桥 setView("plugin:git-review") 切主区。
  * 跨 mount 共享一律走 client/store.mjs（模块级单例）。
+ * Phase 4 = 导航头部加评审摘要 + 提交动作（R10/R11）：提交流在 submit.mjs，
+ * submitter 由本文件在 mount 时创建注入 navigator（entry 级装配点）。
  */
 import { createNavigator } from "./navigator.mjs";
 import { createViewer } from "./viewer.mjs";
+import { createReviewSubmitter } from "./submit.mjs";
 import { apiBaseFromUrl } from "./store.mjs";
 
 /**
@@ -52,10 +55,14 @@ export default {
 		const role = detectRole(el);
 		if (role === "navigator") {
 			// 右栏导航：消费 Phase 1 路由的真实现（数据通道见文件头注释）。
+			const apiBase = apiBaseFromUrl(import.meta.url);
 			const nav = createNavigator({
-				apiBase: apiBaseFromUrl(import.meta.url),
+				apiBase,
 				ctx,
 				document: el.ownerDocument ?? globalThis.document,
+				// R11 提交装配（entry 级装配点）：submitter 在这里创建注入视图 ——
+				// 桥投递 / marker 推进 / 剪贴板兜底全在提交流（submit.mjs），视图只渲染通知。
+				submitter: createReviewSubmitter({ apiBase }),
 			});
 			el.appendChild(nav.root);
 			void nav.refresh(); // 首次装载（视图自身只渲染 loading 态，不自动发请求，便于测试确定性）

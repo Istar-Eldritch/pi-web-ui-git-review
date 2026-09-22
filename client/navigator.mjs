@@ -23,6 +23,7 @@
  */
 import { DEFAULT_BASE_CANDIDATES } from "./gitcore.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
+import { createReviewSubmitter } from "./submit.mjs";
 import * as store from "./store.mjs";
 
 /* ------------------------------------------------------------------ */
@@ -279,6 +280,36 @@ export const NAVIGATOR_CSS = `
 	border: 1px solid var(--gr-border); border-radius: 6px; padding: 4px 8px;
 }
 .gr-prow { display: flex; gap: 6px; }
+
+/* ---- Phase 4（R9/R10/R11）：徽标、评审摘要、提交动作、可见通知 ---- */
+.gr-comment-badge {
+	flex: none; font-size: 10px; padding: 0 5px; border-radius: 7px;
+	border: 1px solid var(--gr-accent); color: var(--gr-accent); white-space: nowrap;
+}
+.gr-summary { padding: 6px 8px; border-bottom: 1px solid var(--gr-border); display: flex; flex-direction: column; gap: 4px; }
+.gr-summary-label { font-size: 11px; color: var(--gr-dim); }
+.gr-summary-input {
+	width: 100%; font: inherit; font-size: 12px; color: inherit; background: var(--bg, #0d0e12);
+	border: 1px solid var(--gr-border); border-radius: 6px; padding: 4px 8px; resize: vertical; min-height: 40px;
+}
+.gr-submitrow { display: flex; gap: 6px; align-items: center; }
+.gr-submit {
+	font: inherit; font-size: 12px; cursor: pointer; color: var(--text, #e6e8ef); background: var(--gr-soft);
+	border: 1px solid var(--gr-accent); border-radius: 6px; padding: 3px 10px; white-space: nowrap;
+}
+.gr-submit:hover { background: var(--gr-hover); }
+.gr-notice {
+	padding: 6px 10px; font-size: 11.5px; border-top: 1px solid var(--gr-border);
+	display: flex; align-items: baseline; gap: 6px; white-space: pre-line;
+}
+.gr-notice.error { color: var(--gr-amber); }
+.gr-notice.done { color: var(--gr-green); }
+.gr-notice-text { flex: none; }
+.gr-notice-grow { flex: 1 1 auto; min-width: 0; }
+.gr-notice-message {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px;
+	overflow: hidden; text-overflow: ellipsis; white-space: pre; min-width: 0; flex: 1 1 auto;
+}
 `;
 
 const styledDocs = new WeakSet();
@@ -347,6 +378,9 @@ export function createNavigator(opts = {}) {
 	let treeSeq = 0;
 	let pickerOpen = false;
 	const collapsed = new Set(); // 目录折叠（会话内即可，不持久化）
+	let uiNotice = null; // Phase 4 可见通知 { kind, text, copyable?, copyText?, messageText? }（只被新通知替换，卸载随之消失）
+	let submitting = false;
+	let submitter = null; // 兜底构建的提交流（opts.submitter 已注入时直接用）
 
 	const modes = () => store.getState().viewModes;
 
@@ -499,6 +533,12 @@ export function createNavigator(opts = {}) {
 			main.append(el("div", { class: "gr-name", text: name }));
 			if (sub) main.append(el("div", { class: "gr-sub", text: sub }));
 			row.append(main);
+		}
+		// R9 每文件评论数徽标：行级/文件级草稿条数（store 写经 store.subscribe →
+		// render 同步，草稿活过 tab 卸载所以徽标也活过）。变更行与全树静态行都显示。
+		const draftCount = store.commentCountForPath(file.path);
+		if (draftCount > 0) {
+			row.append(el("span", { class: "gr-comment-badge", text: `💬${draftCount}`, title: t("nav.commentBadge.title", { n: draftCount }) }));
 		}
 		return row;
 	}
@@ -699,15 +739,110 @@ export function createNavigator(opts = {}) {
 		return renderChangedList();
 	}
 
+	/* ---- 评审摘要 + 提交动作（Phase 4, R10/R11）---- */
+
+	/**
+	 * 摘要框（R10）：挂载局部元素，值从 store 草稿恢复（活过 tab 卸载）；打字经
+	 * **静默写盘**进 store（另一 mount 不因打字重渲染）。任何状态都在（评审出错/
+	 * 加载中也有）—— 提交的非法态由守卫给可见通知，不是隐藏入口。
+	 */
+	function renderSummarySection() {
+		const input = (model.els.summaryInput = el("textarea", {
+			class: "gr-summary-input",
+			placeholder: t("nav.summary.placeholder"),
+			value: store.getSummary(),
+		}));
+		input.addEventListener("input", () => {
+			store.setSummary(input.value);
+		});
+		return el("div", { class: "gr-summary" }, [
+			el("div", { class: "gr-summary-label", text: t("nav.summary.label") }),
+			input,
+			el("div", { class: "gr-submitrow" }, [
+				(model.els.submitBtn = el("button", { class: "gr-btn gr-submit", text: t("nav.submit"), onclick: () => void submitReview() })),
+			]),
+		]);
+	}
+
+	/** 兜底提交流（entry.mount 未注入 submitter 时按本视图的通道构建）。 */
+	function defaultSubmitter() {
+		if (!submitter) {
+			submitter = opts.submitter ?? createReviewSubmitter({ apiBase: api, fetchImpl: doFetch, clipboard: opts.clipboard });
+		}
+		return submitter;
+	}
+
+	/**
+	 * 提交（R11）：草稿 + 摘要 + 最近 /review 载荷交给提交流；结果按 reason 渲染
+	 * 可见通知。成功后重拉（marker 已推进 → 基线行显示 post-submit 范围；fresh
+	 * navigator 缺省 = post-submit 范围）。
+	 */
+	async function submitReview() {
+		if (submitting) return;
+		submitting = true;
+		try {
+			const result = await defaultSubmitter().submit({
+				review: store.getState().lastReview,
+				summary: store.getSummary(),
+				comments: store.getComments(),
+			});
+			if (result.ok) {
+				uiNotice = { kind: "done", text: t("nav.submit.done") };
+			} else if (result.reason === "empty") {
+				uiNotice = { kind: "empty", text: t("nav.submit.empty") };
+			} else if (result.reason === "no-review") {
+				uiNotice = { kind: "noReview", text: t("nav.submit.noReview") };
+			} else if (result.reason === "compose-false") {
+				uiNotice = { kind: "fallback", text: t("nav.submit.fallback"), copyable: true, copyText: result.text };
+			} else {
+				uiNotice = { kind: "clipboardFailed", text: t("nav.submit.clipboardFailed"), copyable: true, copyText: result.text, messageText: result.text };
+			}
+			render();
+			if (result.ok) await refresh();
+		} finally {
+			submitting = false;
+		}
+	}
+
+	/** 通知条上的手动兜底复制：成功 → 切回「已复制」；失败 → 保持手动复制提示。 */
+	async function copyNotice() {
+		const text = uiNotice?.copyText;
+		if (typeof text !== "string") return;
+		const ok = await store.copyToClipboard(text, opts.clipboard);
+		if (!ok) {
+			uiNotice = { kind: "clipboardFailed", text: t("nav.submit.clipboardFailed"), copyable: true, copyText: text, messageText: text };
+		} else if (uiNotice?.kind === "clipboardFailed") {
+			uiNotice = { kind: "fallback", text: t("nav.submit.fallback"), copyable: true, copyText: text };
+		}
+		render();
+	}
+
+	function renderNoticeBar() {
+		if (!uiNotice) return null;
+		const bar = el("div", { class: `gr-notice ${uiNotice.kind}`, dataset: { notice: uiNotice.kind } }, [
+			el("span", { class: "gr-notice-text", text: uiNotice.text }),
+			el("span", { class: "gr-notice-grow" }),
+		]);
+		if (uiNotice.copyable) {
+			bar.append((model.els.noticeCopyBtn = el("button", { class: "gr-btn gr-notice-copy", text: t("nav.submit.copy"), onclick: () => void copyNotice() })));
+		}
+		if (uiNotice.messageText) {
+			bar.append(el("span", { class: "gr-notice-message", text: uiNotice.messageText }));
+		}
+		return bar;
+	}
+
 	function render() {
 		model.pickerItems = [];
 		model.rows = [];
 		model.notice = null;
 		root.textContent = "";
-		root.append(renderHead(), renderToolbar());
+		root.append(renderHead(), renderToolbar(), renderSummarySection());
 		const body = el("div", { class: "gr-body" });
 		body.append(renderBody());
 		root.append(body);
+		const noticeBar = renderNoticeBar();
+		if (noticeBar) root.append(noticeBar);
 	}
 
 	/* ---- 数据装载 ---- */

@@ -295,6 +295,7 @@ function resetStore() {
 	store.setSelection(null);
 	store.setState({ lastReview: null });
 	store.setBaseOverride(null);
+	store.clearDrafts(); // Phase 4：草稿也是模块级单例 —— 共享进程的套件间卫生
 	localStorageBag.clear();
 }
 
@@ -660,6 +661,228 @@ describe("viewer fold expand/collapse", () => {
 		assert.equal(gitcore.validateContext("24"), 24);
 		assert.equal(gitcore.validateContext(undefined), undefined);
 		assert.equal(gitcore.validateContext(""), undefined);
+	});
+});
+
+/* ------------------------------------------------------------------ */
+/* 行评论 UI（Phase 4 / R9）：选中 → 行内编辑器 → 草稿/列表/行标记        */
+/* ------------------------------------------------------------------ */
+
+describe("viewer comment UI (Phase 4 / R9)", () => {
+	it("selection opens the inline comment editor; save attaches the draft and clears the selection", async () => {
+		const { view } = await mountViewer("src/app.ts");
+		assert.equal(collect(view.root, "gr-veditor").length, 0); // 无选中 → 无编辑器
+		const rows = lineRowsOf(view.root);
+		hotCellOf(rows[4], "new").click(); // ctx 行 new4 → 内容/新行号缺省锚 new 侧（R9）
+		const editor = collect(view.root, "gr-veditor")[0];
+		assert.ok(editor, "editor must open on selection");
+		assert.equal(collect(editor, "gr-veditor-title")[0].textContent, "添加评论");
+		// 编辑器锚标签 = 消息契约形态（固定文本，agent 契约见 README）
+		assert.equal(collect(editor, "gr-veditor-label")[0].textContent, "src/app.ts:4 (new side)");
+		const input = collect(editor, "gr-veditor-input")[0];
+		assert.ok(input, "editor must render a textarea");
+		input.value = "fix this";
+		input.dispatch("input", {});
+
+		// 打字中重渲染（同一路径 refresh）→ 文本不丢（本地缓冲同步，Phase 3 选中语义保留）
+		await view.refresh();
+		assert.ok(collect(view.root, "gr-veditor")[0], "editor must survive a same-path refresh");
+		assert.equal(collect(view.root, "gr-veditor-input")[0].value, "fix this");
+
+		// 保存：草稿进 store（R9 锚定契约 {path, side, start, end, text}）
+		collect(view.root, "gr-veditor-save")[0].click();
+		assert.deepEqual(store.getComments(), [{ path: "src/app.ts", side: "new", start: 4, end: 4, text: "fix this" }]);
+		// 编辑器关闭 + 选中清空（GitHub 语义：提交后编辑框收起）
+		assert.equal(collect(view.root, "gr-veditor").length, 0);
+		assert.equal(view.getSelection(), null);
+		// 评论列表渲染 + 行标记（new4 行带 ●，其余行不带）
+		const list = collect(view.root, "gr-vcomments")[0];
+		assert.ok(list, "comment list must render after save");
+		assert.equal(collect(list, "gr-vcomment").length, 1);
+		assert.equal(collect(list, "gr-vcomment-anchor")[0].textContent, "src/app.ts:4 (new side)");
+		assert.deepEqual(
+			lineRowsOf(view.root).filter((row) => row.el.classList.contains("commented")).map((row) => row.new),
+			[4],
+		);
+		assert.ok(collect(view.root, "gr-vmark").some((mark) => mark.textContent === "●"));
+		view.destroy();
+	});
+
+	it("extended range selection anchors <start>-<end> and marks the covered rows", async () => {
+		const { view } = await mountViewer("src/app.ts");
+		const rows = lineRowsOf(view.root);
+		hotCellOf(rows[4], "new").click(); // 锚 new4
+		hotCellOf(rows[5], "new").click(); // 第二次点击（同侧 new11）→ 延伸 new4..11
+		assert.deepEqual(view.getSelection(), { path: "src/app.ts", side: "new", start: 4, end: 11 });
+		assert.equal(collect(view.root, "gr-veditor-label")[0].textContent, "src/app.ts:4-11 (new side)");
+		const input = collect(view.root, "gr-veditor-input")[0];
+		input.value = "explain the range";
+		input.dispatch("input", {});
+		collect(view.root, "gr-veditor-save")[0].click();
+		assert.deepEqual(store.getComments(), [{ path: "src/app.ts", side: "new", start: 4, end: 11, text: "explain the range" }]);
+		// 覆盖行：new 号在 [4,11] 的行（new4、new11）带标记；范围外（new12/13）不带
+		assert.deepEqual(
+			lineRowsOf(view.root).filter((row) => row.el.classList.contains("commented")).map((row) => row.new),
+			[4, 11],
+		);
+		view.destroy();
+	});
+
+	it("old-side selection anchors an (old side) comment on a deletion (R9 selectable old side)", async () => {
+		const { view } = await mountViewer("src/app.ts");
+		const rows = lineRowsOf(view.root);
+		hotCellOf(rows[6], "old").click(); // del 行 old11 → 旧行号锚 old 侧
+		assert.equal(collect(view.root, "gr-veditor-label")[0].textContent, "src/app.ts:11 (old side)");
+		const input = collect(view.root, "gr-veditor-input")[0];
+		input.value = "this deletion drops the check";
+		input.dispatch("input", {});
+		collect(view.root, "gr-veditor-save")[0].click();
+		assert.deepEqual(store.getComments(), [{ path: "src/app.ts", side: "old", start: 11, end: 11, text: "this deletion drops the check" }]);
+		// old 侧标记：old 号在 [11,11] 的行（del old11；ctx old10/new11 不在）
+		assert.deepEqual(
+			lineRowsOf(view.root).filter((row) => row.el.classList.contains("commented")).map((row) => row.old),
+			[11],
+		);
+		view.destroy();
+	});
+
+	it("file-level affordance in the header works for binary files (R9 covers binary)", async () => {
+		const { view } = await mountViewer("bin.dat");
+		assert.equal(lineRowsOf(view.root).length, 0); // 二进制无行（行锚定不可用）
+		const btn = collect(view.root, "gr-vfilecomment")[0];
+		assert.ok(btn, "header file-level button must render for binary too");
+		btn.click();
+		assert.equal(collect(view.root, "gr-veditor-label")[0].textContent, "bin.dat (file-level)");
+		assert.equal(collect(view.root, "gr-veditor-input")[0].getAttribute("placeholder"), "针对整个文件的评论…");
+		const input = collect(view.root, "gr-veditor-input")[0];
+		input.value = "binary blob changed — please regenerate";
+		input.dispatch("input", {});
+		collect(view.root, "gr-veditor-save")[0].click();
+		assert.deepEqual(store.getComments(), [{ path: "bin.dat", side: "file", start: 0, end: 0, text: "binary blob changed — please regenerate" }]);
+		view.destroy();
+	});
+
+	it("comment list renders drafts with edit/delete; edit opens prefilled; delete removes draft and marker", async () => {
+		const { view } = await mountViewer("src/app.ts");
+		store.setComment({ path: "src/app.ts", side: "file", start: 0, end: 0, text: "file note" });
+		store.setComment({ path: "src/app.ts", side: "new", start: 4, end: 4, text: "first" });
+		const comments = collect(view.root, "gr-vcomment");
+		assert.equal(comments.length, 2);
+		// 列表序 = 提交序（store.getComments 排序：文件级在前）
+		assert.equal(collect(comments[0], "gr-vcomment-anchor")[0].textContent, "src/app.ts (file-level)");
+		assert.equal(collect(comments[0], "gr-vcomment-text")[0].textContent, "file note");
+		assert.equal(collect(comments[1], "gr-vcomment-anchor")[0].textContent, "src/app.ts:4 (new side)");
+
+		// 编辑：按钮 → 编辑器带原锚 + 原文本（编辑态标题）
+		collect(comments[0], "gr-vcomment-edit")[0].click();
+		assert.equal(collect(view.root, "gr-veditor-title")[0].textContent, "编辑评论");
+		assert.equal(collect(view.root, "gr-veditor-label")[0].textContent, "src/app.ts (file-level)");
+		assert.equal(collect(view.root, "gr-veditor-input")[0].value, "file note");
+		// 取消（编辑态）：编辑器关、原草稿保留
+		collect(view.root, "gr-veditor-cancel")[0].click();
+		assert.equal(collect(view.root, "gr-veditor").length, 0);
+		assert.equal(store.getComments().length, 2);
+
+		// 删除：文件级那条删掉 → 列表与草稿同步、行标记按剩余草稿重算
+		collect(comments[0], "gr-vcomment-delete")[0].click();
+		assert.deepEqual(store.getComments().map((c) => c.text), ["first"]);
+		assert.equal(collect(view.root, "gr-vcomment").length, 1);
+		// 文件级草稿不逐行打标记；剩余行级草稿（new4）的标记保留
+		assert.deepEqual(
+			lineRowsOf(view.root).filter((row) => row.el.classList.contains("commented")).map((row) => row.new),
+			[4],
+		);
+		view.destroy();
+	});
+
+	it("clicking another line retargets the editor; cancel closes it and clears the selection", async () => {
+		const { view } = await mountViewer("src/app.ts");
+		const rows = lineRowsOf(view.root);
+		hotCellOf(rows[4], "new").click();
+		assert.equal(collect(view.root, "gr-veditor-label")[0].textContent, "src/app.ts:4 (new side)");
+		hotCellOf(rows[2], "new").click(); // 另一行 → 编辑器换锚（新评论模式）
+		assert.equal(collect(view.root, "gr-veditor-label")[0].textContent, "src/app.ts:2 (new side)");
+		assert.equal(collect(view.root, "gr-veditor-input")[0].value, "");
+		collect(view.root, "gr-veditor-cancel")[0].click();
+		assert.equal(collect(view.root, "gr-veditor").length, 0);
+		assert.equal(view.getSelection(), null);
+		view.destroy();
+	});
+
+	it("saving with empty text discards: editor closes, no draft stored (R11 empty comment never lands)", async () => {
+		const { view } = await mountViewer("src/app.ts");
+		hotCellOf(lineRowsOf(view.root)[4], "new").click();
+		collect(view.root, "gr-veditor-save")[0].click(); // 空文本直接保存
+		assert.equal(collect(view.root, "gr-veditor").length, 0);
+		assert.deepEqual(store.getComments(), []);
+		assert.equal(view.getSelection(), null);
+		view.destroy();
+	});
+
+	it("path/base change resets the selection and closes the editor (anchors never cross files/bases)", async () => {
+		const { view } = await mountViewer("src/app.ts");
+		hotCellOf(lineRowsOf(view.root)[4], "new").click();
+		assert.ok(collect(view.root, "gr-veditor")[0]);
+		store.setSelection({ path: "feature.txt", base: "main" });
+		await assertEventually(() => collect(view.root, "gr-vpath")[0]?.textContent === "feature.txt");
+		assert.equal(collect(view.root, "gr-veditor").length, 0);
+		assert.equal(view.getSelection(), null);
+		// 路径限定的列表：feature.txt 无草稿 → 不渲染列表
+		assert.equal(collect(view.root, "gr-vcomments").length, 0);
+		view.destroy();
+	});
+
+	it("comment list is path-scoped: another file's drafts show neither list nor row markers", async () => {
+		const { view } = await mountViewer("src/app.ts");
+		store.setComment({ path: "feature.txt", side: "file", start: 0, end: 0, text: "note" });
+		assert.equal(collect(view.root, "gr-vcomments").length, 0);
+		assert.equal(lineRowsOf(view.root).filter((row) => row.el.classList.contains("commented")).length, 0);
+		view.destroy();
+	});
+
+	it("drafts survive viewer unmount/remount (module-state store, R9)", async () => {
+		const first = await mountViewer("src/app.ts");
+		hotCellOf(lineRowsOf(first.view.root)[4], "new").click();
+		const input = collect(first.view.root, "gr-veditor-input")[0];
+		input.value = "survives the tab switch";
+		input.dispatch("input", {});
+		collect(first.view.root, "gr-veditor-save")[0].click();
+		assert.equal(store.getComments().length, 1);
+		first.view.destroy(); // 模拟右栏 tab 切走（宿主卸载）
+
+		// 重新挂载（新 mount 上下文，选中仍在 store）：草稿原样渲染
+		const second = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: first.server.fetchImpl,
+			lang: "zh",
+		});
+		await second.refresh();
+		assert.deepEqual(collect(second.root, "gr-vcomment-text").map((node) => node.textContent), ["survives the tab switch"]);
+		assert.deepEqual(
+			lineRowsOf(second.root).filter((row) => row.el.classList.contains("commented")).map((row) => row.new),
+			[4],
+		);
+		second.destroy();
+	});
+
+	it("pins comment UI strings in both languages (R12)", () => {
+		assert.equal(i18n.t("zh", "viewer.fileComment"), "评论整个文件");
+		assert.equal(i18n.t("en", "viewer.fileComment"), "Comment on file");
+		assert.equal(i18n.t("zh", "viewer.commentEditor.addTitle"), "添加评论");
+		assert.equal(i18n.t("en", "viewer.commentEditor.addTitle"), "Add comment");
+		assert.equal(i18n.t("zh", "viewer.commentEditor.editTitle"), "编辑评论");
+		assert.equal(i18n.t("en", "viewer.commentEditor.editTitle"), "Edit comment");
+		assert.equal(i18n.t("zh", "viewer.commentEditor.save"), "保存");
+		assert.equal(i18n.t("en", "viewer.commentEditor.save"), "Save");
+		assert.equal(i18n.t("zh", "viewer.commentEditor.cancel"), "取消");
+		assert.equal(i18n.t("en", "viewer.commentEditor.cancel"), "Cancel");
+		assert.equal(i18n.t("zh", "viewer.commentEditor.placeholder"), "针对选中行/区间的评论…");
+		assert.equal(i18n.t("en", "viewer.commentEditor.filePlaceholder"), "Comment on the whole file…");
+		assert.equal(i18n.t("zh", "viewer.comments.title", { n: 2 }), "评论草稿（2）");
+		assert.equal(i18n.t("en", "viewer.comments.title", { n: 2 }), "Comment drafts (2)");
+		assert.equal(i18n.t("zh", "viewer.comments.edit"), "编辑");
+		assert.equal(i18n.t("en", "viewer.comments.delete"), "Delete");
 	});
 });
 

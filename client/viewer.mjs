@@ -22,7 +22,7 @@
  * MAX_CONTEXT）；头部「折叠上下文」回到缺省宽度。所有空隙全局同宽 —— 简单、
  * 可测，避免逐空隙的宽度状态机。
  *
- * 行命中模型（Phase 4 消费，本阶段只做命中/选中，不做评论 UI）：
+ * 行命中模型（Phase 3 命中/选中 + Phase 4 评论锚定）：
  *   行身份 = { path, side: "old"|"new", line }。gutter 双击区：旧行号 → old 侧、
  *   新行号 → new 侧；内容列 → 缺省锚 new 侧（R9），del 行锚 old 侧。单行点击 =
  *   fresh 选中；同侧点击在选中区间末端之下 = 从区间起点向下延伸成连续区间；
@@ -32,6 +32,13 @@
  *   查询 getSelection() → { path, side, start, end } | null（start ≤ end），
  *   变化经 onSelectionChanged(cb) 回调（返回注销函数）。路径/基线变化 → 选中
  *   复位（锚不跨文件/跨基线存活）。
+ *
+ * 评论 UI（Phase 4, R9）：选中变化 → 行内编辑器（textarea + 保存/取消）就地
+ *   打开/换锚 —— 编辑器/评论列表走常驻占位槽就地同步，不重建 diff 主体（大 diff
+ *   不因一次点击全量重画）；保存 = 同锚 upsert 草稿（store 写驱动列表与行标记
+ *   就地同步）+ 清选中；取消 = 收起（由选中打开的还一并清选中）。头部有文件级
+ *   入口（side "file"，对二进制也可用）；列表带编辑/删除；行级草稿覆盖的行带
+ *   ● 标记列 + commented 底色。锚都是挂载局部，草稿本体在 store 模块级单例。
  *
  * 共享状态：选中来自 client/store.mjs 单例（selectedPath + selectedBase，由
  * setSelection 原子写入）。viewer 内部订阅 store：任一变化 → 重拉 /diff；无关
@@ -44,6 +51,7 @@
  */
 import { MAX_CONTEXT } from "./gitcore.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
+import { commentAnchorLabel } from "./store.mjs";
 import * as store from "./store.mjs";
 
 /* ------------------------------------------------------------------ */
@@ -207,7 +215,7 @@ export const VIEWER_CSS = `
 .gr-vfold:hover { background: var(--gr-hover); }
 .gr-vfoldgap { flex: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
 .gr-vfoldhint { color: var(--gr-dim); font-size: 11px; }
-.gr-vline { display: grid; grid-template-columns: 6ch 6ch 1.2ch 1fr; align-items: baseline; cursor: default; }
+.gr-vline { display: grid; grid-template-columns: 6ch 6ch 1.2ch 1.2ch 1fr; align-items: baseline; cursor: default; }
 .gr-vg {
 	text-align: right; color: var(--gr-dim); padding: 0 4px; user-select: none; font-size: 11px;
 	overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -221,6 +229,26 @@ export const VIEWER_CSS = `
 .gr-vline.del { background: var(--gr-delbg); }
 .gr-vline.del .gr-vsign { color: var(--gr-red); }
 .gr-vline.selected { background: var(--gr-selbg); }
+.gr-vline.commented { background: var(--gr-soft); }
+.gr-vmark { text-align: center; color: var(--gr-accent); font-size: 11px; }
+.gr-veditor { padding: 6px 8px; border-bottom: 1px solid var(--gr-border); display: flex; flex-direction: column; gap: 4px; }
+.gr-veditor-anchor { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.gr-veditor-title { font-weight: 600; flex: none; }
+.gr-veditor-label {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; color: var(--gr-accent);
+	overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.gr-veditor-input {
+	width: 100%; font: inherit; font-size: 12px; color: inherit; background: var(--bg, #0d0e12);
+	border: 1px solid var(--gr-border); border-radius: 6px; padding: 4px 8px; resize: vertical; min-height: 46px;
+}
+.gr-veditor-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.gr-vcomments { padding: 4px 8px; border-bottom: 1px solid var(--gr-border); display: flex; flex-direction: column; gap: 4px; }
+.gr-vcomments-title { font-size: 11px; color: var(--gr-dim); }
+.gr-vcomment { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.gr-vcomment-anchor { flex: none; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: var(--gr-accent); white-space: nowrap; }
+.gr-vcomment-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; }
+.gr-vcomment .gr-vbtn { padding: 0 6px; font-size: 11px; }
 `;
 
 const styledDocs = new WeakSet();
@@ -283,14 +311,27 @@ export function createViewer(opts = {}) {
 	let selection = null; // { path, side, start, end }（start ≤ end；延伸语义见文件头）
 	const selectionListeners = new Set();
 
+	/* ---- 评论 UI 状态（Phase 4, R9；锚都是挂载局部，草稿本体在 store） ---- */
+	let editorAnchor = null; // { path, side, start, end } | null（编辑器当前锚）
+	let editorText = ""; // 输入缓冲：重渲染（refresh/语言切换/草稿写）后不丢
+	let editorFromSelection = false; // 编辑器由选中打开（取消时要一并收起选中）
+	let editorMode = "add"; // "add" | "edit"（列表编辑按钮 → edit，标题切换）
+	let pathComments = []; // 当前路径的草稿快照（渲染序 = 提交序）
+
 	// 挂载时刻的选中（store 已有选中 → 立即拉数；无 → R7 空态）。
 	const initial = store.getState();
 	let mountedPath = initial.selectedPath ?? null;
 	let mountedBase = initial.selectedBase ?? null;
+	let mountedDraftsVersion = initial.draftsVersion ?? 0;
 
-	const model = { els: {}, rows: [], folds: [] };
+	const model = { els: {}, rows: [], folds: [], commentButtons: [] };
 	const root = el("div", { class: "gr-vroot" });
 	model.els.root = root;
+	// 常驻占位槽：编辑器/评论列表的**就地**管理 —— 选中/草稿变化不重建 diff 主体
+	// （Phase 3 的就地高亮语义保留：大 diff 不该因一次点击全量重画）。槽在 render
+	// 里随 root 重建回挂，内容由 sync*Slot 填充/清空。
+	const editorSlot = el("div", {});
+	const commentsSlot = el("div", {});
 
 	/* ---- HTTP ---- */
 	function apiUrl(path, params) {
@@ -396,6 +437,23 @@ export function createViewer(opts = {}) {
 		}
 	}
 
+	// R9 编辑器联动（内部首听）：选中变化 → 打开/换锚编辑器（就地同步槽，不重渲染
+	// diff 主体）；选中取消（同一点再点/保存后的收起/路径复位）→ 由选中打开的
+	// 编辑器一并收起。外部监听（Phase 3 契约）照常收到同一份快照。
+	onSelectionChanged((snap) => {
+		if (destroyed) return;
+		if (snap) {
+			if (!editorAnchor || editorAnchor.path !== snap.path || editorAnchor.side !== snap.side || editorAnchor.start !== snap.start || editorAnchor.end !== snap.end) {
+				openEditor(snap, { fromSelection: true });
+			}
+		} else if (editorFromSelection) {
+			editorAnchor = null;
+			editorText = "";
+			editorFromSelection = false;
+			syncEditorSlot();
+		}
+	});
+
 	/** 路径/基线变化 → 锚不跨文件/跨基线存活，选中复位（回调照发 null）。 */
 	function resetSelection() {
 		if (!selection) return;
@@ -446,11 +504,33 @@ export function createViewer(opts = {}) {
 
 	/* ---- 渲染 ---- */
 
+	function refreshPathComments() {
+		pathComments = mountedPath ? store.getComments().filter((c) => c.path === mountedPath) : [];
+	}
+
 	function render() {
 		model.rows = [];
 		model.folds = [];
+		model.commentButtons = [];
+		refreshPathComments();
 		root.textContent = "";
-		root.append(renderHead(), renderBody());
+		root.append(renderHead(), editorSlot, commentsSlot, renderBody());
+		syncEditorSlot();
+		syncCommentsSlot();
+	}
+
+	/** 编辑器槽就地同步（选中/草稿变化不重渲染 diff 主体）。 */
+	function syncEditorSlot() {
+		editorSlot.textContent = "";
+		if (!editorAnchor) return;
+		editorSlot.append(buildEditorPanel());
+	}
+
+	/** 评论列表槽就地同步（草稿写盘后列表/标记同步，diff 主体不动）。 */
+	function syncCommentsSlot() {
+		commentsSlot.textContent = "";
+		if (!mountedPath || !pathComments.length) return;
+		commentsSlot.append(buildCommentsPanel(pathComments));
 	}
 
 	function renderHead() {
@@ -465,6 +545,15 @@ export function createViewer(opts = {}) {
 					? (model.els.collapseBtn = el("button", { class: "gr-vbtn", text: t("viewer.collapse"), onclick: () => collapseFolds() }))
 					// 回到缺省宽度时清掉上一次展开渲染遗留的按钮引用（el 跳过 undefined 子节点，DOM 不受影响）。
 					: (model.els.collapseBtn = undefined),
+				// R9 文件级入口：头部按钮，对一切文件可用 —— 尤其二进制（行锚定不可用，
+				// 文件级评论照常可写）。点开时编辑器换锚为文件级（side "file"）。
+				payload?.path
+					? (model.els.fileCommentBtn = el("button", {
+							class: "gr-vbtn gr-vfilecomment",
+							text: t("viewer.fileComment"),
+							onclick: () => openEditor({ path: payload.path, side: "file", start: 0, end: 0 }, { fromSelection: false }),
+						}))
+					: (model.els.fileCommentBtn = undefined),
 				(model.els.refreshBtn = el("button", { class: "gr-vbtn", text: t("nav.refresh"), onclick: () => void refresh() })),
 			]),
 			payload?.base?.ref
@@ -590,20 +679,127 @@ export function createViewer(opts = {}) {
 		if (oldNo !== null) oldCell.addEventListener("click", (event) => onLineClick(line, "old", event));
 		if (newNo !== null) newCell.addEventListener("click", (event) => onLineClick(line, "new", event));
 		const sign = el("span", { class: "gr-vsign", text: isAdd ? "+" : isDel ? "-" : " " });
+		// R9 行标记：行号落在某条同侧草稿区间内的行带 ● + commented 底色
+		// （文件级草稿只进头部列表，不逐行打标记）。标记列就属于第 4 列。
+		const covered = isLineCommented(line);
+		const mark = el("span", { class: "gr-vmark", text: covered ? "●" : "" });
 		// 内容列缺省锚 new 侧（R9），del 行（无 new）锚 old 侧 —— 两种行都可点。
 		const content = el("span", { class: "gr-vcontent", text: line.text ?? "" });
 		content.addEventListener("click", (event) => onLineClick(line, newNo !== null ? "new" : "old", event));
 		const rowEl = el("div", {
-			class: `gr-vline ${line.type}${isLineSelected(line) ? " selected" : ""}`,
+			class: `gr-vline ${line.type}${isLineSelected(line) ? " selected" : ""}${covered ? " commented" : ""}`,
 			dataset: {
 				...(oldNo !== null ? { old: String(oldNo) } : {}),
 				...(newNo !== null ? { new: String(newNo) } : {}),
 				type: line.type,
 			},
 		});
-		rowEl.append(oldCell, newCell, sign, content);
-		model.rows.push({ el: rowEl, line });
+		rowEl.append(oldCell, newCell, sign, mark, content);
+		model.rows.push({ el: rowEl, line, markEl: mark });
 		return rowEl;
+	}
+
+	/** 某渲染行是否被当前路径的行级草稿覆盖（同侧行号落区间内）。 */
+	function isLineCommented(line) {
+		for (const c of pathComments) {
+			if (c.side === "file") continue;
+			const no = c.side === "old" ? line.old : line.new;
+			if (Number.isFinite(no) && no >= c.start && no <= c.end) return true;
+		}
+		return false;
+	}
+
+	/* ---- 评论编辑器（R9）---- */
+
+	/**
+	 * 打开/换锚编辑器（就地同步槽，不重渲染 diff 主体）。text 显式传入 = 编辑态
+	 * （列表编辑按钮）；否则同锚已有草稿预填（对同锚重复选中 = 原位编辑）。
+	 */
+	function openEditor(anchor, opts2 = {}) {
+		if (!anchor || typeof anchor.path !== "string" || !anchor.path) return;
+		editorAnchor = { path: anchor.path, side: anchor.side, start: Number(anchor.start ?? 0), end: Number(anchor.end ?? 0) };
+		editorFromSelection = Boolean(opts2.fromSelection);
+		editorMode = opts2.text != null ? "edit" : "add";
+		const existing = store.getComments().find((c) =>
+			c.path === editorAnchor.path && c.side === editorAnchor.side && c.start === editorAnchor.start && c.end === editorAnchor.end);
+		editorText = opts2.text ?? existing?.text ?? "";
+		syncEditorSlot();
+	}
+
+	/** 保存：同锚 upsert 草稿（store 写驱动列表/标记就地同步）+ 清选中（高亮就地清）。 */
+	function saveEditor() {
+		if (!editorAnchor) return;
+		const anchor = { ...editorAnchor };
+		const text = editorText.trim();
+		editorAnchor = null;
+		editorText = "";
+		editorFromSelection = false;
+		if (text) {
+			store.setComment({ ...anchor, text }); // notify → 草稿通道（列表/标记/编辑器收起）
+		} else {
+			syncEditorSlot(); // 空文本保存 = 丢弃收起（空评论永不落草稿）
+		}
+		resetSelection(); // 高亮就地清 + emit null（编辑器已关，选中监听不重开）
+	}
+
+	/** 取消：收起编辑器；由选中打开的还一并清掉选中（编辑态的取消不动选中）。 */
+	function cancelEditor() {
+		if (!editorAnchor) return;
+		const wasFromSelection = editorFromSelection;
+		editorAnchor = null;
+		editorText = "";
+		editorFromSelection = false;
+		syncEditorSlot();
+		if (wasFromSelection) resetSelection();
+	}
+
+	function buildEditorPanel() {
+		const placeholder = editorAnchor.side === "file" ? t("viewer.commentEditor.filePlaceholder") : t("viewer.commentEditor.placeholder");
+		const input = (model.els.commentInput = el("textarea", {
+			class: "gr-veditor-input",
+			placeholder,
+			value: editorText,
+		}));
+		input.addEventListener("input", () => {
+			editorText = input.value; // 输入缓冲：重渲染（refresh/草稿写）后不丢
+		});
+		return el("div", { class: "gr-veditor", dataset: { editor: "true" } }, [
+			el("div", { class: "gr-veditor-anchor" }, [
+				el("span", { class: "gr-veditor-title", text: t(editorMode === "edit" ? "viewer.commentEditor.editTitle" : "viewer.commentEditor.addTitle") }),
+				el("span", { class: "gr-veditor-label", text: commentAnchorLabel(editorAnchor) }),
+			]),
+			input,
+			el("div", { class: "gr-veditor-actions" }, [
+				(model.els.commentSave = el("button", { class: "gr-vbtn gr-veditor-save", text: t("viewer.commentEditor.save"), onclick: () => saveEditor() })),
+				(model.els.commentCancel = el("button", { class: "gr-vbtn gr-veditor-cancel", text: t("viewer.commentEditor.cancel"), onclick: () => cancelEditor() })),
+			]),
+		]);
+	}
+
+	function buildCommentsPanel(list) {
+		const box = el("div", { class: "gr-vcomments", dataset: { comments: "true" } }, [
+			el("div", { class: "gr-vcomments-title", text: t("viewer.comments.title", { n: list.length }) }),
+		]);
+		for (const c of list) {
+			const editBtn = el("button", {
+				class: "gr-vbtn gr-vcomment-edit",
+				text: t("viewer.comments.edit"),
+				onclick: () => openEditor({ path: c.path, side: c.side, start: c.start, end: c.end }, { text: c.text }),
+			});
+			const deleteBtn = el("button", {
+				class: "gr-vbtn gr-vcomment-delete",
+				text: t("viewer.comments.delete"),
+				onclick: () => store.removeComment(c), // notify → 草稿通道同步列表与行标记
+			});
+			model.commentButtons.push({ comment: c, editBtn, deleteBtn });
+			box.append(el("div", { class: "gr-vcomment", dataset: { side: c.side, start: String(c.start), end: String(c.end) } }, [
+				el("span", { class: "gr-vcomment-anchor", text: commentAnchorLabel(c) }),
+				el("span", { class: "gr-vcomment-text", text: c.text }),
+				editBtn,
+				deleteBtn,
+			]));
+		}
+		return box;
 	}
 
 	function onLineClick(line, side, event) {
@@ -613,14 +809,29 @@ export function createViewer(opts = {}) {
 
 	/* ---- store 联动（R15：两个 mount 靠共享单例同步） ---- */
 
-	// selectedPath / selectedBase 任一变化 → 选中复位（锚不跨文件/基线）+ 重拉；
-	// 无关写入（视图模式、评论草稿等）fetch-key 比对后跳过。
+	// selectedPath / selectedBase 任一变化 → 选中复位（锚不跨文件/基线）+ 重拉 +
+	// 编辑器收起（复位路径 emit null → 内部选中监听就地收起）。fetch-key 未变的
+	// 写入（视图模式等）跳过；草稿版本变化 → 就地同步评论槽 + 行标记（不重拉）。
 	const unsubscribe = store.subscribe(() => {
 		if (destroyed) return;
 		const s = store.getState();
 		const path = s.selectedPath ?? null;
 		const base = s.selectedBase ?? null;
-		if (path === mountedPath && base === mountedBase) return;
+		if (path === mountedPath && base === mountedBase) {
+			const version = s.draftsVersion ?? 0;
+			if (version !== mountedDraftsVersion) {
+				mountedDraftsVersion = version;
+				refreshPathComments();
+				syncEditorSlot(); // 编辑器可能已被保存/删除清掉（就地收起）；编辑中被另一 mount 写盘则按缓冲重建
+				syncCommentsSlot();
+				for (const row of model.rows) {
+					const covered = isLineCommented(row.line);
+					row.el.classList.toggle("commented", covered);
+					if (row.markEl) row.markEl.textContent = covered ? "●" : "";
+				}
+			}
+			return;
+		}
 		resetSelection();
 		mountedPath = path;
 		mountedBase = base;

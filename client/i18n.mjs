@@ -64,6 +64,19 @@ export const DICT = {
 		"nav.flag.unstaged": "未暂存",
 		"nav.tree.changedCount": "+{n}",
 
+		// Phase 4（R9/R10/R11）：徽标、评审摘要、提交动作与可见通知。
+		// 注意：R11 组装文本本身是固定英文契约（agent 契约，见 README），不在字典里。
+		"nav.commentBadge.title": "{n} 条评论草稿",
+		"nav.summary.label": "评审摘要",
+		"nav.summary.placeholder": "本次评审的整体说明（可选）…",
+		"nav.submit": "提交评审",
+		"nav.submit.empty": "没有可提交的内容：先添加评论或填写摘要。",
+		"nav.submit.noReview": "评审基线未就绪，无法提交。",
+		"nav.submit.done": "评审已投递为草稿；标记已推进到 HEAD。",
+		"nav.submit.fallback": "评审投递失败（聊天输入不可用）：文本已复制到剪贴板。",
+		"nav.submit.clipboardFailed": "评审投递失败，且剪贴板不可用；请手动复制下方文本。",
+		"nav.submit.copy": "复制",
+
 		"viewer.empty": "主区 diff 查看器",
 		"viewer.emptyHint": "从右侧导航（Diff 评审标签页）选择一个文件，即可在此查看它的统一 diff。",
 		"viewer.state.loading": "加载中…",
@@ -82,6 +95,18 @@ export const DICT = {
 		"viewer.fold": "⋯ {n} 行未变更",
 		"viewer.foldHint": "点击展开上下文",
 		"viewer.collapse": "折叠上下文",
+
+		// Phase 4（R9）：行内评论编辑器 + 草稿列表 + 文件级入口。
+		"viewer.fileComment": "评论整个文件",
+		"viewer.comments.title": "评论草稿（{n}）",
+		"viewer.comments.edit": "编辑",
+		"viewer.comments.delete": "删除",
+		"viewer.commentEditor.addTitle": "添加评论",
+		"viewer.commentEditor.editTitle": "编辑评论",
+		"viewer.commentEditor.placeholder": "针对选中行/区间的评论…",
+		"viewer.commentEditor.filePlaceholder": "针对整个文件的评论…",
+		"viewer.commentEditor.save": "保存",
+		"viewer.commentEditor.cancel": "取消",
 	},
 	en: {
 		"nav.title": "Diff Review",
@@ -136,6 +161,20 @@ export const DICT = {
 		"nav.flag.unstaged": "unstaged",
 		"nav.tree.changedCount": "+{n}",
 
+		// Phase 4 (R9/R10/R11): badge, review summary, submit action, visible notices.
+		// Note: the R11 assembled message itself is the fixed English agent contract
+		// (see README) and is deliberately not in this dictionary.
+		"nav.commentBadge.title": "{n} comment drafts",
+		"nav.summary.label": "Review summary",
+		"nav.summary.placeholder": "Overall description of this review (optional)…",
+		"nav.submit": "Submit review",
+		"nav.submit.empty": "Nothing to submit: add a comment or fill in the summary first.",
+		"nav.submit.noReview": "The review baseline is not loaded; submit is unavailable.",
+		"nav.submit.done": "Review delivered as a draft; the marker advanced to HEAD.",
+		"nav.submit.fallback": "Could not deliver the review (no composer): the text was copied to the clipboard.",
+		"nav.submit.clipboardFailed": "Could not deliver the review and the clipboard is unavailable; copy the text below manually.",
+		"nav.submit.copy": "Copy",
+
 		"viewer.empty": "Diff viewer",
 		"viewer.emptyHint": "Pick a file in the right-panel navigator (Diff Review tab) to view its unified diff here.",
 		"viewer.state.loading": "Loading…",
@@ -154,6 +193,18 @@ export const DICT = {
 		"viewer.fold": "⋯ {n} unchanged lines",
 		"viewer.foldHint": "Click to expand context",
 		"viewer.collapse": "Collapse context",
+
+		// Phase 4 (R9): inline comment editor + draft list + file-level affordance.
+		"viewer.fileComment": "Comment on file",
+		"viewer.comments.title": "Comment drafts ({n})",
+		"viewer.comments.edit": "Edit",
+		"viewer.comments.delete": "Delete",
+		"viewer.commentEditor.addTitle": "Add comment",
+		"viewer.commentEditor.editTitle": "Edit comment",
+		"viewer.commentEditor.placeholder": "Comment on the selected line/range…",
+		"viewer.commentEditor.filePlaceholder": "Comment on the whole file…",
+		"viewer.commentEditor.save": "Save",
+		"viewer.commentEditor.cancel": "Cancel",
 	},
 };
 
