@@ -7,14 +7,15 @@
  * 永远 200 + {ok:false,error}（R13），客户端看 ok 字段。
  *
  * 渲染形态（R8，统一 diff）：
- *   头部：路径 + 状态字母 + 特例注记（新文件/已删除/重命名 old → new/二进制）、
- *         活动基线（ref@短哈希）、截断标记（数据已由服务端 capPatch 截好，R16）、
- *         刷新 / 折叠上下文（展开了更宽 -U 后出现）。
+ *   头部：路径 + 状态字母 + 特例注记（新文件/已删除/重命名 old → new/二进制/
+ *         R18 未变更预览）、活动基线（ref@短哈希）、截断标记（数据已由服务端
+ *         capPatch 截好，R16）、刷新 / 折叠上下文（展开了更宽 -U 后出现；预览态
+ *         无折叠语义，按钮隐藏）。
  *   主体：逐行渲染 —— 旧/新行号双 gutter、+/−/空格 符号列、内容列（monospace +
  *         white-space:pre，保留 git 输出的行内空白）；hunk 头行；两 hunk 之间的
  *         折叠空隙行「⋯ N 行未变更」。特例：二进制（注记 + 无行）、未跟踪
  *         （untracked:true 零 hunk → 「还没有 diff」状态）、范围外已跟踪文件
- *         （零 hunk 无 status → 范围外状态）。
+ *         （零 hunk 无 status → 范围外状态）、R18 未变更预览（全 ctx 无 hunk 头）。
  *
  * 折叠空隙的展开（R8）：空隙内容服务端没发过（-U3 的 elided 上下文），展开 =
  * 经 GET /diff&context=<宽度>（git diff -U<width>）重取更宽上下文：空隙变成带
@@ -48,6 +49,11 @@
  * Phase 5（R17）内嵌形态：createViewer 新增可选 opts.onClose —— 传入时头部
  * 多一个「关闭」按钮（inline.mjs 的内嵌面板用：点它还原消息面板）；全屏挂载
  * 不传，头部与 Phase 4 完全一致。
+ *
+ * Phase 5（R18）未变更预览：/diff 返回零 hunk 且非 untracked/二进制（范围外
+ * 已跟踪文件）→ 链式再取 GET /blob?path=&base=（未变更文件全文，全 ctx 单
+ * hunk、old=new=1..n）。/blob 成功 → preview 态渲染（无 hunk 头、可选中可评论
+ * —— 行号口径与 diff 一致，提交流程零特例）；失败 → 保留 /diff 的范围外空态。
  *
  * 纯逻辑（折叠空隙计算、行模型、状态归类）导出为独立函数，node --test 用极小
  * 假 DOM + 桩 fetch 驱动整个视图（见 test/viewer.test.mjs；fixture 补丁文本
@@ -109,9 +115,11 @@ export function buildDiffRows(payload) {
 }
 
 /**
- * /diff 载荷 → 展示归类（R8 特例各态可辨，零 hunk 的三种病因分开）：
+ * /diff（或 /blob）载荷 → 展示归类（R8 特例各态可辨，零 hunk 的病因分开）：
  *   mode: "rows"（正常渲染行）| "binary"（二进制注记 + 无行）
  *       | "untracked"（untracked:true 零 hunk）| "out-of-range"（范围内没该文件）
+ *       | "preview"（R18 未变更文件全文预览：/blob 的 preview:true；行模型与
+ *         rows 同构 —— 全 ctx 单 hunk，行号基线/HEAD 两侧一致，评论照常锚定）
  *   newFile/deleted/renamed/truncated: 头部注记开关。
  */
 export function describeViewerState(payload) {
@@ -123,9 +131,11 @@ export function describeViewerState(payload) {
 			? "binary"
 			: payload.untracked
 				? "untracked"
-				: hunks.length === 0
-					? "out-of-range"
-					: "rows",
+				: payload.preview === true
+					? "preview"
+					: hunks.length === 0
+						? "out-of-range"
+						: "rows",
 		newFile: payload.status === "A",
 		deleted: payload.status === "D",
 		renamed,
@@ -201,6 +211,7 @@ export const VIEWER_CSS = `
 .gr-vbaserow { display: flex; align-items: baseline; gap: 6px; min-width: 0; color: var(--gr-dim); font-size: 11.5px; }
 .gr-vbaseref { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gr-vnote { font-size: 11.5px; color: var(--gr-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gr-vnote-preview { color: var(--gr-accent); }
 .gr-vbanner {
 	padding: 5px 8px; font-size: 11.5px; color: var(--gr-amber);
 	border-bottom: 1px solid var(--gr-border); white-space: pre-line;
@@ -382,6 +393,33 @@ export function createViewer(opts = {}) {
 			if (my !== seq) return;
 			if (data?.ok) {
 				payload = data;
+				// R18 未变更预览链：范围外已跟踪文件（零 hunk、非 untracked/二进制）→
+				// 再取 /blob 换全文预览。blob 腿失败（路径不在基线/网络）→ 保留 /diff
+				// 的范围外空态 —— 独立 try 包住，绝不把好端端的 /diff 结果打回错误态。
+				// 零 hunk 但路径必然不在基线的状态不白打：A（新增）、R/C（rename/copy
+				// 新路径不在基线）。M/T（零 hunk = 仅模式变化）与 D（删除的空文件在基线
+				// 存在）都能取到内容 —— D 成功时预览空文件态，比「范围外」提示更如实。
+				const chainable = !data.status || data.status === "M" || data.status === "T" || data.status === "D";
+				if (chainable && Array.isArray(data.hunks) && data.hunks.length === 0 && data.untracked !== true && data.binary !== true) {
+					try {
+						const blobRes = await doFetch(apiUrl("/blob", { path, base }), { credentials: "same-origin" });
+						const blobText = await blobRes.text();
+						let blobData;
+						try {
+							blobData = blobText ? JSON.parse(blobText) : {};
+						} catch {
+							throw new Error(`bad response (${blobRes.status})`);
+						}
+						if (my !== seq) return;
+						if (blobData?.ok) {
+							// /diff 的 status（范围内零 hunk，如仅模式变化）随预览载荷保留 ——
+							// 头部能如实显示 M 徽标，注记也用「内容未变更」而非「未变更文件」。
+							payload = data.status ? { ...blobData, status: data.status } : blobData;
+						}
+					} catch {
+						/* blob 链失败 → 范围外空态不变 */
+					}
+				}
 			} else {
 				payload = null;
 				errorText = data?.error ?? "unknown error";
@@ -399,6 +437,8 @@ export function createViewer(opts = {}) {
 	/** 折叠空隙「点击展开」：宽度 3→24 再 ×2（封顶 MAX_CONTEXT，服务端校验同口径）。 */
 	function expandFolds() {
 		if (destroyed) return;
+		// R18 预览态没有折叠语义（全 ctx 单 hunk）→ 展开是空操作，别白打一次请求。
+		if (payload && describeViewerState(payload).mode === "preview") return;
 		const next = contextWidth === DEFAULT_CONTEXT ? FIRST_EXPAND_CONTEXT : Math.min(contextWidth * 2, MAX_CONTEXT);
 		if (next === contextWidth) return;
 		contextWidth = next;
@@ -542,12 +582,14 @@ export function createViewer(opts = {}) {
 	function renderHead() {
 		const st = payload && payload.status ? payload.status : null;
 		const cls = statusClass(st);
+		const mode = payload ? describeViewerState(payload).mode : null;
 		const head = el("div", { class: "gr-vhead" }, [
 			el("div", { class: "gr-vpathrow" }, [
 				payload?.path ? el("span", { class: "gr-vpath", text: payload.path }) : null,
 				st ? el("span", { class: `gr-vst ${cls}`, text: st }) : null,
 				el("span", { class: "gr-vgrow" }),
-				contextWidth !== DEFAULT_CONTEXT
+				// 预览态没有折叠空隙语义（全 ctx 单 hunk）→ 不给「折叠上下文」按钮。
+				contextWidth !== DEFAULT_CONTEXT && mode !== "preview"
 					? (model.els.collapseBtn = el("button", { class: "gr-vbtn", text: t("viewer.collapse"), onclick: () => collapseFolds() }))
 					// 回到缺省宽度时清掉上一次展开渲染遗留的按钮引用（el 跳过 undefined 子节点，DOM 不受影响）。
 					: (model.els.collapseBtn = undefined),
@@ -583,7 +625,7 @@ export function createViewer(opts = {}) {
 		return head;
 	}
 
-	/** 头部特例注记（R8：新文件 / 已删除 / 重命名 old → new / 二进制）。 */
+	/** 头部特例注记（R8：新文件 / 已删除 / 重命名 old → new / 二进制；R18 预览态）。 */
 	function renderNotes() {
 		if (!payload) return [];
 		const d = describeViewerState(payload);
@@ -591,8 +633,15 @@ export function createViewer(opts = {}) {
 		if (d.renamed) notes.push(el("div", { class: "gr-vnote", text: t("viewer.kind.renamed", { old: payload.oldPath, new: payload.path }) }));
 		if (d.newFile) notes.push(el("div", { class: "gr-vnote", text: t("viewer.kind.newFile") }));
 		if (d.deleted) notes.push(el("div", { class: "gr-vnote", text: t("viewer.kind.deleted") }));
+		if (d.mode === "preview") {
+			// R18：范围外未变更（无 status）→「未变更文件」注记；范围内零 hunk（如仅
+			// 权限/模式变化，status 存在）→ 如实区分，别把已列入评审范围的文件说成未变更。
+			const key = payload.status ? "viewer.kind.previewInRange" : "viewer.kind.preview";
+			notes.push(el("div", { class: "gr-vnote gr-vnote-preview", text: t(key) }));
+		}
 		if (d.mode === "binary") {
-			notes.push(el("div", { class: "gr-vnote", text: t("viewer.kind.binary") }));
+			// R18：预览态的二进制没有「变更」可言 —— 注记用预览措辞。
+			notes.push(el("div", { class: "gr-vnote", text: t(payload.preview ? "viewer.kind.binaryPreview" : "viewer.kind.binary") }));
 			notes.push(el("div", { class: "gr-vnote", text: t("viewer.kind.binaryHint") }));
 		}
 		return notes;
@@ -636,11 +685,18 @@ export function createViewer(opts = {}) {
 		}
 		const d = describeViewerState(payload);
 		if (d.truncated) {
-			// R8/R16：服务端已截断 → 可见截断标记（数据本身已被 capPatch 截好）。
-			body.append(el("div", { class: "gr-vbanner", text: t("viewer.kind.truncated"), dataset: { truncated: "true" } }));
+			// R8/R16：服务端已截断 → 可见截断标记（数据本身已被 capPatch 截好；
+			// R18 预览态的截断另有一句不提「diff」的文案）。
+			body.append(
+				el("div", {
+					class: "gr-vbanner",
+					text: t(d.mode === "preview" ? "viewer.kind.previewTruncated" : "viewer.kind.truncated"),
+					dataset: { truncated: "true" },
+				}),
+			);
 		}
 		if (d.mode === "binary") {
-			body.append(stateBox(t("viewer.kind.binary"), t("viewer.kind.binaryHint")));
+			body.append(stateBox(t(payload?.preview ? "viewer.kind.binaryPreview" : "viewer.kind.binary"), t("viewer.kind.binaryHint")));
 			return body;
 		}
 		if (d.mode === "untracked") {
@@ -651,13 +707,25 @@ export function createViewer(opts = {}) {
 			body.append(stateBox(t("viewer.state.outOfRange"), t("viewer.state.outOfRangeHint")));
 			return body;
 		}
+		if (d.mode === "preview") {
+			// R18 未变更预览：全 ctx 单 hunk。空文件（0 行）单独可辨；行渲染与 rows
+			// 同一条 lineRow 路径（选中/评论/标记零特例），只是不画 hunk 头。
+			const hunks = Array.isArray(payload.hunks) ? payload.hunks : [];
+			if (!hunks.length) {
+				body.append(stateBox(t("viewer.state.emptyFile"), t("viewer.state.emptyFileHint")));
+				return body;
+			}
+			body.append(renderDiffRows({ headers: false }));
+			return body;
+		}
 		body.append(renderDiffRows());
 		return body;
 	}
 
-	function renderDiffRows() {
+	function renderDiffRows({ headers = true } = {}) {
 		const box = el("div", { class: "gr-vdiff" });
 		for (const row of buildDiffRows(payload)) {
+			if (row.kind === "hunk-header" && !headers) continue;
 			if (row.kind === "fold") {
 				const fold = el(
 					"div",

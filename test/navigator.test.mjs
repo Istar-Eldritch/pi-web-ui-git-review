@@ -149,7 +149,7 @@ function resetStore() {
 	localStorageBag.clear();
 }
 
-async function mountNavigator(routes, { lang = "zh", ctx } = {}) {
+async function mountNavigator(routes, { lang = "zh", ctx, openFile } = {}) {
 	const server = createStubServer(routes);
 	const view = navModule.createNavigator({
 		document: new FakeDocument(),
@@ -157,6 +157,7 @@ async function mountNavigator(routes, { lang = "zh", ctx } = {}) {
 		fetchImpl: server.fetchImpl,
 		lang,
 		ctx,
+		openFile,
 	});
 	await view.refresh();
 	return { view, server };
@@ -342,9 +343,10 @@ describe("navigator toggles (tree/flat and changed/full)", () => {
 		view.destroy();
 	});
 
-	it("changed/full fetches /tree, badges changed files, and leaves unchanged rows unselectable", async () => {
+	it("changed/full fetches /tree, badges changed files; unchanged rows open the preview (R18)", async () => {
 		resetStore();
-		const { view, server } = await mountNavigator(standardRoutes());
+		const opened = [];
+		const { view, server } = await mountNavigator(standardRoutes(), { openFile: () => opened.push(store.getState().selectedPath) });
 		collect(view.root, "gr-segbtn").find((button) => button.textContent === "全树").click();
 		await assertEventually(() => rowsOf(view.root).some((row) => row.path === "readme.md"), "full tree must render");
 
@@ -358,17 +360,24 @@ describe("navigator toggles (tree/flat and changed/full)", () => {
 		assert.equal(statusOf(changed), "M"); // 变更徽章（状态字母）
 		const unchanged = rows.find((row) => row.path === "readme.md");
 		assert.equal(statusOf(unchanged), null);
-		assert.ok(unchanged.el.classList.contains("static"));
+		assert.ok(unchanged.el.classList.contains("preview"), "unchanged rows render in preview style");
+		assert.ok(!unchanged.el.classList.contains("static"));
 
 		const dirBadge = collect(view.root, "gr-dirrow").find((row) => row.dataset.dir === "dir");
 		assert.ok(dirBadge.textContent.includes("+1")); // 目录变更徽章
 
-		// 未变更行不可选中：点击不改共享选中
-		const before = store.getState().selectedPath;
+		// R18：未变更行也可选中 —— 同一条 {path, base} 原子写入 + 内嵌优先的展示入口
 		unchanged.el.click();
-		assert.equal(store.getState().selectedPath, before);
+		assert.equal(store.getState().selectedPath, "readme.md");
+		assert.deepEqual(opened, ["readme.md"], "unchanged row click routes through openFile like changed rows");
+		// 重渲染后选中高亮落在预览行上（与变更行一致的高亮语义）
+		assert.ok(
+			rowsOf(view.root).find((row) => row.path === "readme.md").el.classList.contains("selected"),
+			"selected highlight lands on the preview row",
+		);
 		changed.el.click();
 		assert.equal(store.getState().selectedPath, "keep.txt");
+		assert.deepEqual(opened, ["readme.md", "keep.txt"]);
 
 		// 回到仅变更：/review 清单恢复
 		collect(view.root, "gr-segbtn").find((button) => button.textContent === "仅变更").click();

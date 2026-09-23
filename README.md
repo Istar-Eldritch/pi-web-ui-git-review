@@ -20,7 +20,9 @@
 ## 使用
 
 1. **看变更**：右栏「Diff 评审」tab 列出相对评审基线（存储的 marker，缺省主线预选）的全部变更 —— 含已提交 +
-   未提交 + 未跟踪（各有可见标记），改名显示 `old → new`，可切树形/平铺、仅变更/全树。
+   未提交 + 未跟踪（各有可见标记），改名显示 `old → new`，可切树形/平铺、仅变更/全树。**全树里未变更的文件也
+   可以点击**（R18，降调样式）：打开它的**全文预览**（基线内容，行号与 HEAD 一致），行级/文件级评论照常可写 ——
+   给还没改的文件提前留评审意见（如「这个文件拆一下」）。
 2. **选基线**：头部「更改」打开基线选择器（本地/远程分支、最近提交、手动输入）；覆盖只影响本次评审，**永不移动存储的 marker**。
 3. **读 diff**：点文件 → diff 面板（旧/新双行号、可展开的未变更折叠、新文件/删除/改名/二进制/截断各态）。
    展示形态（R17，内嵌优先）：diff **替换聊天主区的消息列表面板**（`main.main > .messages-wrap` 的内容），
@@ -110,6 +112,12 @@ Agent 收到后按行号/侧注记定位，修复被指出的评论并重新提�
 - **草稿并入语义**：`compose({text})` 只投文本、绝不读改既有草稿（宿主 `composer-bridge.ts` 全有或全无拒收；
   `composer-draft.ts mergeRecalledDraft` 并入）。
 - 其余桥触点都是文档化宿主 API：`setView`（R7）、`onLocale`（R12，change-only）、`onData` 广播（cwd 变化重拉）。
+- **插件 reload 的 ESM 缓存边界（实测踩过）**：宿主的 `plugins_reload` 以 `index.mjs?e=<epoch>` 重新 import ——
+  查询串只击穿**入口文件本身**的缓存；它的静态相对 import（`./client/gitcore.mjs`）解析回同一无查询 URL，
+  永远命中宿主进程首次激活缓存的旧实例。因此：新增 gitcore 导出再让 index.mjs import 它们 → reload 后
+  activate 直接失败（缺导出）、全部路由 404。对策（已实施）：只被服务端消费的逻辑放 `index.mjs`（如 R18 的
+  `looksBinary` / `previewHunks`），gitcore 只保留客户端也消费的解析器/常量 —— 这样 index.mjs 的 import 面对旧
+  缓存实例永远成立，reload 即可生效。若确需改 gitcore 里共享的既有函数，需要**整体重启宿主进程**。
 
 ## 开发
 
@@ -117,7 +125,7 @@ Agent 收到后按行号/侧注记定位，修复被指出的评论并重新提�
 面板对齐），客户端是裸 ESM（`client/*.mjs`，`textContent`-only DOM，无 npm import、无共享 React）。
 
 ```sh
-node --test test/     # 全部套件（gitcore 解析器 / server-smoke 真仓库路由 / tree-route / navigator / viewer / inline / comments）
+node --test test/     # 全部套件（gitcore 解析器 / server-smoke 真仓库路由含 /blob 与 index.mjs 纯函数 / tree-route / navigator / viewer / inline / comments）
 node --check <file>   # 逐文件语法
 ```
 

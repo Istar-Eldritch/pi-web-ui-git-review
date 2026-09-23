@@ -32,6 +32,8 @@ const entry = (await import("../client/entry.mjs")).default; // R1 宿主契约�
 const navModule = await import("../client/navigator.mjs");
 const i18n = await import("../client/i18n.mjs");
 const gitcore = await import("../client/gitcore.mjs");
+// R18 预览助手住在服务端入口（gitcore 尾注：不进共享模块，避免 reload 缓存坑）
+const { previewHunks } = await import("../index.mjs");
 const { parseUnifiedDiff } = gitcore;
 
 /* ------------------------------------------------------------------ */
@@ -382,6 +384,10 @@ describe("viewer pure helpers", () => {
 		assert.equal(viewerModule.describeViewerState(payloadFromPatch(BINARY_PATCH, "bin.dat")).mode, "binary");
 		assert.equal(viewerModule.describeViewerState({ hunks: [], untracked: true }).mode, "untracked");
 		assert.equal(viewerModule.describeViewerState({ hunks: [] }).mode, "out-of-range");
+		// R18：预览态（/blob 的 preview:true）—— 优先于 out-of-range，但不抢 binary 态
+		assert.equal(viewerModule.describeViewerState({ hunks: [{ lines: [] }], preview: true }).mode, "preview");
+		assert.equal(viewerModule.describeViewerState({ hunks: [], preview: true }).mode, "preview");
+		assert.equal(viewerModule.describeViewerState({ hunks: [], preview: true, binary: true }).mode, "binary");
 		assert.equal(viewerModule.describeViewerState({ hunks: [{ lines: [] }], truncated: true }).truncated, true);
 		assert.deepEqual(viewerModule.describeViewerState(null), { mode: "rows", newFile: false, deleted: false, renamed: false, truncated: false });
 	});
@@ -1381,5 +1387,279 @@ describe("viewer lifecycle and cleanup symmetry (R15)", () => {
 			globalThis.window = previousWindow;
 			store.setSelection(null);
 		}
+	});
+});
+
+/* ------------------------------------------------------------------ */
+/* R18：未变更文件的预览态（/diff 范围外 → /blob 链）                     */
+/* ------------------------------------------------------------------ */
+
+/** /blob 桩路由：全文经 previewHunks（index.mjs）合成与服务端同构的载荷。 */
+function blobRouteFor(text, overrides = {}) {
+	return () => {
+		const { hunks, truncated } = previewHunks(text);
+		return {
+			ok: true,
+			path: "main.txt",
+			base: { ref: "main", sha: SHA_BASE, source: "marker" },
+			head: { sha: SHA_HEAD },
+			preview: true,
+			binary: false,
+			truncated,
+			hunks,
+			...overrides,
+		};
+	};
+}
+
+describe("unchanged-file preview (R18: /blob chain)", () => {
+	it("out-of-range /diff chains into /blob and renders the full text without hunk headers", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({ "/blob": blobRouteFor("alpha\nbeta\ngamma\n") });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(server.calls.some((call) => call.route === "/diff"), "/diff fetched first");
+		assert.ok(server.calls.some((call) => call.route === "/blob"), "zero-hunk diff chains into /blob");
+		const rows = lineRowsOf(view.root);
+		assert.deepEqual(
+			rows.map((row) => [row.old, row.new, row.type, row.text]),
+			[
+				[1, 1, "ctx", "alpha"],
+				[2, 2, "ctx", "beta"],
+				[3, 3, "ctx", "gamma"],
+			],
+			"preview lines are all-context with old=new numbering",
+		);
+		assert.equal(collect(view.root, "gr-vhunkhead").length, 0, "no hunk headers in preview mode");
+		assert.ok(notesOf(view.root).some((note) => note.includes("未变更文件")), "preview note renders in the header");
+		view.destroy();
+	});
+
+	it("in-range zero-hunk previews (e.g. mode-only change, status M) get their own honest note", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({
+			"main.txt": () => ({
+				ok: true,
+				path: "main.txt",
+				base: { ref: "main", sha: SHA_BASE, source: "marker" },
+				head: { sha: SHA_HEAD },
+				status: "M", // 范围内（如 chmod-only）→ 零 hunk 但带 status
+				binary: false,
+				truncated: false,
+				hunks: [],
+			}),
+			"/blob": blobRouteFor("alpha\n"),
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(notesOf(view.root).some((note) => note.includes("文件内容未变更")), "in-range note, not the unchanged-file note");
+		assert.ok(!notesOf(view.root).some((note) => note.includes("未变更文件：")));
+		assert.ok(collect(view.root, "gr-vst").some((badge) => badge.textContent === "M"), "status badge survives the chain");
+		view.destroy();
+	});
+
+	it("line selection and comments work on preview lines (same anchoring as diffs)", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({ "/blob": blobRouteFor("alpha\nbeta\ngamma\n") });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		const rows = lineRowsOf(view.root);
+		hotCellOf(rows[1], "new").click();
+		assert.deepEqual(view.getSelection(), { path: "main.txt", side: "new", start: 2, end: 2 });
+		assert.equal(collect(view.root, "gr-veditor-label")[0].textContent, "main.txt:2 (new side)");
+		const input = collect(view.root, "gr-veditor-input")[0];
+		input.value = "rename this?";
+		input.dispatch("input", {});
+		collect(view.root, "gr-veditor-save")[0].click();
+		assert.deepEqual(store.getComments(), [{ path: "main.txt", side: "new", start: 2, end: 2, text: "rename this?" }]);
+		assert.deepEqual(
+			lineRowsOf(view.root).filter((row) => row.el.classList.contains("commented")).map((row) => row.new),
+			[2],
+		);
+		view.destroy();
+	});
+
+	it("blob failure keeps the out-of-range state (no error clobbering)", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({}); // 无 /blob 桩 → 404 {ok:false}
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(server.calls.some((call) => call.route === "/blob"));
+		assert.ok(
+			stateBoxesOf(view.root).some((text) => text.includes("相对评审基线没有该文件的变更")),
+			"out-of-range state survives the failed blob leg",
+		);
+		assert.equal(lineRowsOf(view.root).length, 0);
+		view.destroy();
+	});
+
+	it("statuses whose path cannot exist at the base never chain (A/R/C) — no wasted request", async () => {
+		for (const status of ["A", "R", "C"]) {
+			resetStore();
+			store.setSelection({ path: "main.txt", base: "main" });
+			const server = createStubServer({
+				"main.txt": () => ({
+					ok: true,
+					path: "main.txt",
+					base: { ref: "main", sha: SHA_BASE, source: "marker" },
+					head: { sha: SHA_HEAD },
+					status,
+					...(status === "R" ? { oldPath: "old.txt" } : {}),
+					binary: false,
+					truncated: false,
+					hunks: [],
+				}),
+			});
+			const view = viewerModule.createViewer({
+				document: new FakeDocument(),
+				apiBase: "/plugins-api/git-review",
+				fetchImpl: server.fetchImpl,
+				lang: "zh",
+			});
+			await view.refresh();
+			assert.ok(!server.calls.some((call) => call.route === "/blob"), `status ${status} must not fetch /blob`);
+			assert.ok(stateBoxesOf(view.root).some((text) => text.includes("相对评审基线没有该文件的变更")));
+			view.destroy();
+		}
+	});
+
+	it("deleted empty files (status D, zero hunks) chain and show the empty-file state", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({
+			"main.txt": () => ({
+				ok: true,
+				path: "main.txt",
+				base: { ref: "main", sha: SHA_BASE, source: "marker" },
+				head: { sha: SHA_HEAD },
+				status: "D",
+				binary: false,
+				truncated: false,
+				hunks: [], // 删除的空文件：补丁零行
+			}),
+			"/blob": blobRouteFor(""), // 基线上存在 → 空内容
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(server.calls.some((call) => call.route === "/blob"));
+		assert.ok(stateBoxesOf(view.root).some((text) => text.includes("空文件（0 行）")), "honest empty-file state, not out-of-range");
+		view.destroy();
+	});
+
+	it("untracked files never chain into /blob (untracked state stands)", async () => {
+		resetStore();
+		store.setSelection({ path: "untracked.txt", base: "main" });
+		const server = createStubServer({});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(!server.calls.some((call) => call.route === "/blob"), "untracked short-circuits the blob leg");
+		assert.ok(stateBoxesOf(view.root).some((text) => text.includes("未跟踪文件")));
+		view.destroy();
+	});
+
+	it("binary preview renders the binary state with preview wording and no line rows", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({ "/blob": blobRouteFor("", { binary: true, hunks: [] }) });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(stateBoxesOf(view.root).some((text) => text.includes("未变更的二进制文件")), "preview wording, not the changed wording");
+		assert.ok(!stateBoxesOf(view.root).some((text) => text.includes("二进制文件变更")));
+		assert.equal(lineRowsOf(view.root).length, 0);
+		assert.ok(collect(view.root, "gr-vfilecomment")[0], "file-level comment entry still available");
+		view.destroy();
+	});
+
+	it("empty-file preview gets its own state (0 lines is not out-of-range)", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({ "/blob": blobRouteFor("") });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(stateBoxesOf(view.root).some((text) => text.includes("空文件（0 行）")));
+		view.destroy();
+	});
+
+	it("truncated preview shows the preview-specific banner", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({ "/blob": blobRouteFor("x\n".repeat(20), { truncated: true }) });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		const banner = collect(view.root, "gr-vbanner")[0];
+		assert.ok(banner, "truncation banner renders");
+		assert.equal(banner.dataset.truncated, "true");
+		assert.ok(banner.textContent.includes("预览已截断"));
+		assert.ok(!banner.textContent.includes("diff 已截断"), "preview wording, not the diff wording");
+		view.destroy();
+	});
+
+	it("fold expansion is suppressed in preview mode (no collapse button, no fold rows)", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({ "/blob": blobRouteFor("alpha\nbeta\n") });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		view.expandFolds(); // 预览态无折叠语义 → 空操作，不白打请求
+		await tick();
+		assert.equal(server.calls.filter((call) => call.route === "/blob").length, 1, "expand is a no-op in preview mode");
+		assert.equal(lineRowsOf(view.root).length, 2, "rows unchanged");
+		assert.equal(collect(view.root, "gr-vfold").length, 0);
+		assert.ok(!collect(view.root, "gr-vbtn").some((btn) => btn.textContent === "折叠上下文"), "no collapse button in preview");
+		view.destroy();
 	});
 });

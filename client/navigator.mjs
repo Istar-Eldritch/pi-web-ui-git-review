@@ -24,6 +24,10 @@
  * Phase 5（R17）：文件点击改走**内嵌优先** —— createNavigator 新增可选
  * opts.openFile（entry 注入 inline.open：diff 装进聊天主区的消息面板位置，
  * 输入框留在原地）；未注入（测试/兑底）保留旧的 setView 全屏切换（R7）。
+ *
+ * Phase 5（R18）：全树模式未变更文件行也可点击 —— 同一选中通道（store 共享
+ * 选中）进 viewer；/diff 对这类文件返回范围外空态时 viewer 链式取 /blob 预览
+ * 全文，行级评论照常可用（未变更文件基线/HEAD/工作树三处同内容）。
  */
 import { DEFAULT_BASE_CANDIDATES } from "./gitcore.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
@@ -249,7 +253,9 @@ export const NAVIGATOR_CSS = `
 .gr-row { display: flex; align-items: baseline; gap: 6px; padding: 3px 8px; cursor: pointer; }
 .gr-row:hover { background: var(--gr-hover); }
 .gr-row.selected { background: var(--gr-soft); }
-.gr-row.static, .gr-row.static:hover { cursor: default; background: transparent; }
+/* R18：全树未变更行可点（预览态）—— 整行降调、悬息恢复，与变更行区分。 */
+.gr-row.preview { color: var(--gr-dim); }
+.gr-row.preview:hover { color: var(--text, #e6e8ef); }
 .gr-st { flex: none; min-width: 13px; text-align: center; font-family: ui-monospace, Menlo, Consolas, monospace; font-weight: 700; font-size: 11px; }
 .gr-st.A { color: var(--gr-green); }
 .gr-st.D { color: var(--gr-red); }
@@ -504,13 +510,25 @@ export function createNavigator(opts = {}) {
 		return bar;
 	}
 
-	/** 文件行（Phase 1 /review 行契约：status 字母、add/del、rename old→new、flags）。 */
+	/** 选中并打开（R7/R17/R18 共用入口）：{path, base} 原子写入共享 store（viewer
+	 *  对任一变化重拉 /diff，范围外时链式取 /blob 预览），展示内嵌优先（R17）——
+	 *  entry 注入 openFile（inline 控制器装进聊天主区消息面板位置，锚不到时它自己
+	 *  回落全屏）；未注入（测试/兑底）→ 旧的 setView 全屏切换（桥不可用时安静降级）。 */
+	function selectAndOpen(path) {
+		const override = store.getState().baseOverride;
+		store.setSelection({ path, base: override?.ref ?? review?.base?.ref ?? null });
+		if (typeof opts.openFile === "function") opts.openFile();
+		else activateMainView();
+	}
+
+	/** 文件行（Phase 1 /review 行契约：status 字母、add/del、rename old→new、flags；
+	 *  R18：changed:false 的全树未变更行也可点 —— preview 态预览 + 评论）。 */
 	function fileRow(file, { depth = 0, selected = false, changed = true } = {}) {
 		const row = el("div", {
-			class: `gr-row${changed ? "" : " static"}${selected ? " selected" : ""}`,
+			class: `gr-row${changed ? "" : " preview"}${selected ? " selected" : ""}`,
 			style: `padding-left:${8 + depth * 12}px`,
 			dataset: { path: file.path },
-			title: changed ? t("nav.select", { path: file.path }) : file.path,
+			title: t(changed ? "nav.select" : "nav.select.preview", { path: file.path }),
 		});
 		const main = el("div", { class: "gr-main" });
 		const name = file.path.split("/").pop() || file.path;
@@ -528,24 +546,16 @@ export function createNavigator(opts = {}) {
 			for (const label of flagLabels(file.flags, t)) {
 				row.append(el("span", { class: `gr-flag${isUntracked ? " untracked" : ""}`, text: label }));
 			}
-			row.addEventListener("click", () => {
-				// R7/R17：选中进共享 store（{path, base} 原子写入 —— viewer 对任一变化重拉
-				// /diff）。展示内嵌优先（R17）：entry 注入 openFile —— inline 控制器把
-				// diff 装进聊天主区的消息面板位置（输入框留在原地），锚找不到时它自己
-				// 回落全屏；未注入 openFile（测试/兑底）→ 旧的 setView 全屏切换（桥不可
-				// 用时安静降级 no-op）。
-				const override = store.getState().baseOverride;
-				store.setSelection({ path: file.path, base: override?.ref ?? review?.base?.ref ?? null });
-				if (typeof opts.openFile === "function") opts.openFile();
-				else activateMainView();
-			});
+			row.addEventListener("click", () => selectAndOpen(file.path));
 		} else {
 			main.append(el("div", { class: "gr-name", text: name }));
 			if (sub) main.append(el("div", { class: "gr-sub", text: sub }));
 			row.append(main);
+			// R18：未变更行同一条选中通道 —— viewer 预览基线全文，评论照常可写。
+			row.addEventListener("click", () => selectAndOpen(file.path));
 		}
 		// R9 每文件评论数徽标：行级/文件级草稿条数（store 写经 store.subscribe →
-		// render 同步，草稿活过 tab 卸载所以徽标也活过）。变更行与全树静态行都显示。
+		// render 同步，草稿活过 tab 卸载所以徽标也活过）。变更行与全树预览行都显示。
 		const draftCount = store.commentCountForPath(file.path);
 		if (draftCount > 0) {
 			row.append(el("span", { class: "gr-comment-badge", text: `💬${draftCount}`, title: t("nav.commentBadge.title", { n: draftCount }) }));
@@ -714,7 +724,7 @@ export function createNavigator(opts = {}) {
 			const file = fileMap.get(n.path);
 			const row = file
 				? fileRow(file, { depth: n.depth, selected: store.getState().selectedPath === n.path })
-				: fileRow({ path: n.path }, { depth: n.depth, changed: false });
+				: fileRow({ path: n.path }, { depth: n.depth, changed: false, selected: store.getState().selectedPath === n.path });
 			model.rows.push({ el: row, file: file ?? { path: n.path } });
 			box.append(row);
 		}

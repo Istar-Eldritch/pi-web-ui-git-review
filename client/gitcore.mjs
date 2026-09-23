@@ -92,6 +92,13 @@ export function validateLimit(value, { fallback = DEFAULT_COMMIT_LIMIT, max = MA
  *  也封在这里 —— 客户端增长常量与服务端校验共用一个源头）。 */
 export const MAX_CONTEXT = 1000;
 
+/* R18 注：looksBinary / previewHunks（/blob 预览的服务端助手）**刻意不放这里** ——
+ * 它们只被服务端 index.mjs 消费，而宿主的插件 reload 只用 epoch 查询串击穿
+ * index.mjs 本身的 ESM 缓存，index 的相对 import（本文件）永远命中进程启动以来
+ * 缓存的旧实例。放这里的新导出会让 reload 后的 activate 因「缺导出」直接失败
+ * （实测踩过）。只被服务端用的逻辑放 index.mjs；本文件只保留客户端也消费的
+ * 解析器/常量。 */
+
 /**
  * 校验 /diff 的 context 宽度（R8 折叠空隙「点击展开」的取数参数，路由转成
  * `git diff -U<width>`）：无参数/空串 → undefined（argv 不加 -U，git 缺省 3 行

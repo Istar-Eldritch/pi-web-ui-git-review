@@ -15,7 +15,7 @@ import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import gitReview from "../index.mjs";
+import gitReview, { looksBinary, previewHunks } from "../index.mjs";
 import { detectRole } from "../client/entry.mjs";
 import { apiBaseFromUrl, getState, setState, subscribe } from "../client/store.mjs";
 import { MAX_FILES, MAX_PATCH_CHARS, markerKey } from "../client/gitcore.mjs";
@@ -137,6 +137,8 @@ function buildFixtureRepo() {
 	g(["config", "user.name", "Test"]);
 	writeFileSync(join(root, "keep.txt"), "keep\n");
 	writeFileSync(join(root, "del.txt"), "delete me\n");
+	// R18 预览 fixture：基线后就不再动的二进制文件（/blob → binary:true 分支）
+	writeFileSync(join(root, "still.bin"), Buffer.from([0, 1, 2, 0x62, 0x61, 0x73, 0x65]));
 	writeFileSync(join(root, "bin.dat"), Buffer.from([0, 1, 2, 0x62, 0x61, 0x73, 0x65]));
 	writeFileSync(join(root, "staged.txt"), "staged line v1\n");
 	writeFileSync(join(root, "unstaged.txt"), "unstaged line v1\n");
@@ -592,6 +594,163 @@ describe("truncation caps (R16 / oversized-diff two-tier semantics)", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("GET /blob (R18 unchanged-file preview)", () => {
+	it("returns the full text of an unchanged file as one all-context hunk (old=new=1..n)", async () => {
+		const host = freshHost();
+		const out = await callRoute(host, "GET", "/blob", { query: { path: "keep.txt", base: "main" } });
+		assert.equal(out.ok, true);
+		assert.equal(out.preview, true);
+		assert.equal(out.binary, false);
+		assert.equal(out.truncated, false);
+		assert.equal(out.path, "keep.txt");
+		assert.deepEqual(out.base, { ref: "main", sha: FIX.main, source: "param" });
+		assert.deepEqual(out.head, { sha: FIX.head });
+		assert.equal(out.hunks.length, 1);
+		assert.deepEqual(
+			{ ...out.hunks[0], lines: out.hunks[0].lines.map((l) => [l.type, l.old, l.new, l.text]) },
+			{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: [["ctx", 1, 1, "keep"]] },
+		);
+	});
+
+	it("marks binary content (NUL sniff) and skips line synthesis", async () => {
+		const host = freshHost();
+		const out = await callRoute(host, "GET", "/blob", { query: { path: "still.bin", base: "main" } });
+		assert.equal(out.ok, true);
+		assert.equal(out.preview, true);
+		assert.equal(out.binary, true);
+		assert.deepEqual(out.hunks, []);
+	});
+
+	it("resolves the base like /diff when ?base= is absent (default candidates)", async () => {
+		const host = freshHost();
+		const out = await callRoute(host, "GET", "/blob", { query: { path: "keep.txt" } });
+		assert.equal(out.ok, true);
+		// fixture 无 marker、无 origin/HEAD 符号引用 → 首个可解析候选 origin/main
+		assert.equal(out.base.ref, "origin/main");
+		assert.equal(out.hunks[0].lines[0].text, "keep");
+	});
+
+	it("fails structured for a path missing at the base (viewer keeps its out-of-range state)", async () => {
+		const host = freshHost();
+		const out = await callRoute(host, "GET", "/blob", { query: { path: "feature.txt", base: "main" } });
+		assert.equal(out.ok, false);
+		assert.match(out.error, /feature\.txt|does not exist|exists on disk/);
+	});
+
+	it("validates the path with the same R14 guardrails", async () => {
+		const host = freshHost();
+		for (const bad of ["../escape", "/abs", ":magic", "--"]) {
+			const out = await callRoute(host, "GET", "/blob", { query: { path: bad, base: "main" } });
+			assert.equal(out.ok, false, `must reject ${bad}`);
+			assert.match(out.error, /invalid path/);
+		}
+	});
+
+	it("caps oversized files with truncated:true (no marker line synthesized into content)", async () => {
+		const { root, g } = makeScratchRepo("git-review-blob-");
+		try {
+			g(["commit", "-q", "--allow-empty", "-m", "base"]);
+			const big = "x".repeat(MAX_PATCH_CHARS + 10) + "\nlast line\n";
+			writeFileSync(join(root, "big.txt"), big);
+			g(["add", "big.txt"]);
+			g(["commit", "-q", "-m", "big file"]);
+			const host = freshHost({ cwd: root });
+			const out = await callRoute(host, "GET", "/blob", { query: { path: "big.txt", base: "main" } });
+			assert.equal(out.ok, true);
+			assert.equal(out.truncated, true);
+			const text = out.hunks[0].lines.map((l) => l.text).join("\n");
+			assert.ok(text.length <= MAX_PATCH_CHARS);
+			assert.ok(!text.includes("diff truncated"), "no capPatch marker line in previews");
+			assert.ok(!text.includes("last line"));
+		} finally {
+			try {
+				rmSync(root, { recursive: true, force: true });
+			} catch {
+				/* 清理失败不影响结论 */
+			}
+		}
+	});
+
+	it("non-repo workspace fails structured like every other route", async () => {
+		const scratch = mkdtempSync(join(tmpdir(), "git-review-nonrepo-"));
+		try {
+			const host = freshHost({ cwd: scratch });
+			const out = await callRoute(host, "GET", "/blob", { query: { path: "x.txt", base: "main" } });
+			assert.equal(out.ok, false);
+			assert.match(out.error, /not a git repository/);
+		} finally {
+			try {
+				rmSync(scratch, { recursive: true, force: true });
+			} catch {
+				/* 清理失败不影响结论 */
+			}
+		}
+	});
+});
+
+/* ------------------------------------------------------------------ */
+/* R18 预览纯函数（实现随服务端住在 index.mjs —— 见 client/gitcore.mjs 尾注）*/
+/* ------------------------------------------------------------------ */
+
+describe("looksBinary (R18 NUL sniff)", () => {
+	it("flags NUL within the first 8000 chars, ignores it beyond", () => {
+		assert.equal(looksBinary("text\u0000more"), true);
+		assert.equal(looksBinary("plain text"), false);
+		const late = `${"x".repeat(8000)}\u0000tail`;
+		assert.equal(looksBinary(late), false, "NUL beyond the sniff window does not count");
+	});
+	it("tolerates empty / non-string input", () => {
+		assert.equal(looksBinary(""), false);
+		assert.equal(looksBinary(undefined), false);
+	});
+});
+
+describe("previewHunks (R18 full-text preview)", () => {
+	it("builds a single all-context hunk with old=new=1..n numbering", () => {
+		const { hunks, truncated } = previewHunks("alpha\nbeta\ngamma\n");
+		assert.equal(truncated, false);
+		assert.equal(hunks.length, 1);
+		assert.deepEqual(
+			{ ...hunks[0], lines: hunks[0].lines.map((l) => [l.type, l.old, l.new, l.text]) },
+			{
+				oldStart: 1,
+				oldLines: 3,
+				newStart: 1,
+				newLines: 3,
+				lines: [
+					["ctx", 1, 1, "alpha"],
+					["ctx", 2, 2, "beta"],
+					["ctx", 3, 3, "gamma"],
+				],
+			},
+		);
+	});
+	it("drops exactly one trailing artifact line; keeps real empty lines", () => {
+		// "a\n\n" → 行 ["a", ""]：尾随换行的伪行 pop 掉，中间空行是真内容
+		const { hunks } = previewHunks("a\n\n");
+		assert.deepEqual(hunks[0].lines.map((l) => l.text), ["a", ""]);
+		assert.deepEqual(hunks[0].lines.map((l) => l.new), [1, 2]);
+		// 不以换行结尾的最后一行原样保留
+		const noEol = previewHunks("a\nb");
+		assert.deepEqual(noEol.hunks[0].lines.map((l) => l.text), ["a", "b"]);
+		// 单个空行文件（\n）= 一行空内容
+		const blank = previewHunks("\n");
+		assert.deepEqual(blank.hunks[0].lines.map((l) => l.text), [""]);
+	});
+	it("empty text → no hunks (viewer renders the empty-file state)", () => {
+		assert.deepEqual(previewHunks(""), { hunks: [], truncated: false });
+	});
+	it("caps at MAX_PATCH_CHARS with truncated:true and no fake marker line", () => {
+		const big = `${"y".repeat(MAX_PATCH_CHARS)}tail\nlast\n`;
+		const { hunks, truncated } = previewHunks(big);
+		assert.equal(truncated, true);
+		const text = hunks[0].lines.map((l) => l.text).join("\n");
+		assert.ok(text.length <= MAX_PATCH_CHARS);
+		assert.ok(!text.includes("diff truncated"), "no capPatch marker line in previews");
+		assert.ok(!hunks[0].lines.some((l) => l.text.includes("tail")), "content beyond the cap is gone");
 	});
 });
 

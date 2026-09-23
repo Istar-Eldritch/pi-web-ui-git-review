@@ -446,3 +446,6 @@ describe("DEFAULT_BASE_CANDIDATES (R4 order)", () => {
 		assert.deepEqual(DEFAULT_BASE_CANDIDATES, ["origin/HEAD", "origin/main", "origin/master", "main", "master"]);
 	});
 });
+
+/* R18 注：looksBinary / previewHunks 的纯函数测试随实现住在 server-smoke
+ * （它们是服务端专属逻辑，见 client/gitcore.mjs 尾注 —— 不进共享 gitcore）。 */

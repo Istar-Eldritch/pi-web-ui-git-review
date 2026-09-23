@@ -32,6 +32,14 @@
  *   GET  /resolve?ref=   → { ok, ref, sha }（ref → 完整提交哈希；基线选择器用）
  *   GET  /tree           → { ok, files:[path…], total, truncated }（全工作区文件树，R6：
  *                          `git ls-files` + status untracked 并入，仓库根相对，截断同 /review）
+ *   GET  /blob?path=&base= → { ok, path, base, head, preview:true, binary, truncated,
+ *                              hunks:[{oldStart,oldLines,newStart,newLines,
+ *                              lines:[{type:"ctx",old,new,text}]}] }
+ *                          未变更文件的全文预览（R18，全树模式点未变更文件用）：
+ *                          单个全 ctx hunk、old=new=1..n（基线/HEAD 两侧行号相同）。
+ *                          二进制（NUL 探测）→ binary:true + 无行（只留文件级评论）；
+ *                          超 MAX_PATCH_CHARS 截尾 truncated:true；路径不在基线 →
+ *                          {ok:false,error}（客户端保留 /diff 的范围外空态）。
  *
  * 每条失败路径都是结构化 `{ ok:false, error }`（R13）：不是 git 仓库、未知/非法
  * base、stale marker、非法参数……一律可恢复错误，绝不抛穿。HTTP 状态保持 200，
@@ -61,8 +69,53 @@ import {
 
 const execGitRaw = promisify(execFile);
 
+/* ------------------------------------------------------------------ */
+/* R18 预览助手（服务端专属，刻意不进 client/gitcore.mjs —— 见该文件尾注：  */
+/* 宿主插件 reload 只击穿 index.mjs 的 ESM 缓存，共享模块的新导出会让       */
+/* 重新激活直接失败。这里只放服务端消费的逻辑，node --test 从本文件导入。    */
+/* ------------------------------------------------------------------ */
+
+/** looksBinary 的探测窗口（git convert.c 同款思路：解码后前 8000 字符出现 NUL → 二进制）。 */
+export const BINARY_SNIFF_CHARS = 8000;
+
+/**
+ * 文本是否疑似二进制（R18 预览用）：解码后的文本前 8000 字符里出现 NUL 字节。
+ * 二进制 blob 解码后必然产生乱码，行级预览/锚定都无意义 —— 调用方回落二进制态
+ * （只留文件级评论，与变更二进制的 viewer 语义一致）。execFile 已把字节流按
+ * utf8 解成 JS 字符串，NUL 字节在解码后仍保留，这里零额外 git 调用即可判定。
+ */
+export function looksBinary(text) {
+	return String(text ?? "").slice(0, BINARY_SNIFF_CHARS).includes("\u0000");
+}
+
+/**
+ * 未变更文件的全文 → 预览行模型（R18）：单个全 ctx hunk，old=new=1..n —— 预览的
+ * 行号在基线与 HEAD 两侧相同，评论锚定任一侧都指同一行。纯函数（node --test 直测）：
+ *   - 尾随换行只产生伪空行：pop 恰好一个（"a\n\n" → ["a",""]，中间空行是真内容）；
+ *   - 不以换行结尾的文件最后一行原样保留；空文本 → hunks:[]（调用方渲染「空文件」态）；
+ *   - 超 MAX_PATCH_CHARS 截尾并置 truncated:true（不注入 capPatch 的截断尾注 ——
+ *     那行会成为预览里的假内容行，截断由 truncated 标记 + 客户端横幅表达）。
+ * 返回 { hunks, truncated }；hunks 形态与 parseUnifiedDiff 同构（渲染层零特例）。
+ */
+export function previewHunks(text) {
+	let body = String(text ?? "");
+	let truncated = false;
+	if (body.length > MAX_PATCH_CHARS) {
+		body = body.slice(0, MAX_PATCH_CHARS);
+		truncated = true;
+	}
+	if (body === "") return { hunks: [], truncated };
+	const lines = body.split("\n");
+	if (body.endsWith("\n") && lines.length && lines[lines.length - 1] === "") lines.pop();
+	const n = lines.length;
+	return {
+		truncated,
+		hunks: [{ oldStart: 1, oldLines: n, newStart: 1, newLines: n, lines: lines.map((line, i) => ({ type: "ctx", old: i + 1, new: i + 1, text: line })) }],
+	};
+}
+
 /** R14：只放行白名单内的只读 git 子命令（diff/log/status/ls-files/rev-parse/
- *  merge-base/for-each-ref 族）。git 永远不经 shell。 */
+ *  merge-base/for-each-ref/show 族；show 仅用于 /blob 的 `<sha>:<path>` 全文读取）。git 永远不经 shell。 */
 const ALLOWED_SUBCOMMANDS = new Set([
 	"diff",
 	"log",
@@ -71,6 +124,7 @@ const ALLOWED_SUBCOMMANDS = new Set([
 	"rev-parse",
 	"merge-base",
 	"for-each-ref",
+	"show",
 ]);
 
 /** 跑一条 git 命令并映射错误（server/scm.ts:59 git() 镜像，英文文案——
@@ -357,6 +411,25 @@ async function diffPayload(host, root, rawBase, rawPath, rawContext) {
 	};
 }
 
+/** /blob：未变更文件的全文预览（R18）。基线解析与 /diff 同一套 resolveBase +
+ *  merge-base 语义；`git show <merge-base>:<path>` 读全文 —— 未变更文件在基线、
+ *  HEAD 与工作树三处内容一致（否则它就在 /diff 范围内了），所以基线内容即可
+ *  评论的行号口径。路径不在基线（另一分支新增的文件/已删文件）→ git 报错 →
+ *  withRepo 落 {ok:false,error}，客户端保留 /diff 的范围外空态。 */
+async function blobPayload(host, root, rawBase, rawPath) {
+	const base = await resolveBase(host, root, rawBase);
+	const path = validatePath(String(rawPath ?? ""));
+	const headSha = await revParseCommit(root, "HEAD");
+	const mb = await mergeBaseWithHead(root, base.sha, base.ref);
+	const raw = await git(root, ["show", `${mb}:${path}`]);
+	if (looksBinary(raw)) {
+		// 二进制（NUL 探测）→ 与变更二进制同语义：不渲染行，只留文件级评论。
+		return { ok: true, path, base, head: { sha: headSha }, preview: true, binary: true, truncated: false, hunks: [] };
+	}
+	const { hunks, truncated } = previewHunks(raw);
+	return { ok: true, path, base, head: { sha: headSha }, preview: true, binary: false, truncated, hunks };
+}
+
 export default {
 	activate(host) {
 		const offs = [];
@@ -466,6 +539,10 @@ export default {
 			res.json(await treePayload(root));
 		}));
 
+		route("GET", "/blob", withRepo(async (root, req, res) => {
+			res.json(await blobPayload(host, root, req?.query?.base, req?.query?.path));
+		}));
+
 		route("GET", "/resolve", withRepo(async (root, req, res) => {
 			const raw = req?.query?.ref;
 			if (typeof raw !== "string" || raw.trim() === "") {
@@ -495,7 +572,7 @@ export default {
 		);
 
 		try {
-			host.log("info", "[git-review] routes registered: /review /diff /refs /commits /marker /resolve /tree");
+			host.log("info", "[git-review] routes registered: /review /diff /refs /commits /marker /resolve /tree /blob");
 		} catch {
 			/* 日志不可用也不影响激活 */
 		}
