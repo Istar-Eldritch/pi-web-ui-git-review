@@ -102,6 +102,10 @@ export const DICT = {
 		"viewer.foldHint": "点击展开上下文",
 		"viewer.collapse": "折叠上下文",
 
+		// R21：语法高亮开关（头部按钮；开态描边高亮）。
+		"viewer.syntax": "语法高亮",
+		"viewer.syntaxHint": "按文件类型给 diff 内容着色（点击开关）",
+
 		// Phase 5（R17）：内嵌面板的还原入口（opts.onClose 注入才有此按钮）。
 		"viewer.close": "关闭",
 
@@ -208,6 +212,10 @@ export const DICT = {
 		"viewer.fold": "⋯ {n} unchanged lines",
 		"viewer.foldHint": "Click to expand context",
 		"viewer.collapse": "Collapse context",
+
+		// R21: syntax-highlight toggle (header button; "on" state is outlined).
+		"viewer.syntax": "Syntax",
+		"viewer.syntaxHint": "Colorize diff content by file type (click to toggle)",
 
 		// Phase 5（R17）：inline panel restore entry (rendered only with opts.onClose).
 		"viewer.close": "Close",

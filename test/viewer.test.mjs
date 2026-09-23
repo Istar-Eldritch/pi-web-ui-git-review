@@ -1942,6 +1942,57 @@ describe("unchanged-file preview (R18: /blob chain)", () => {
 		view.destroy();
 	});
 
+	it("syntax highlighting tokenizes the content column (default on, R21)", async () => {
+		resetStore();
+		const { view } = await mountViewer("src/app.ts");
+		// js 家族：const → kw 色；分词不丢字 —— content 的全文本恒等于行文本
+		const rows = lineRowsOf(view.root);
+		const addRow = rows.find((row) => row.type === "add" && row.text === "const b = 20;");
+		assert.ok(addRow, "fixture add row present");
+		assert.equal(addRow.text, "const b = 20;", "tokenization never changes the line text");
+		const kws = collect(addRow.el, "gr-tok-kw").map((span) => span.textContent);
+		assert.deepEqual(kws, ["const"], "const is keyword-colored");
+		assert.ok(collect(addRow.el, "gr-tok-num").some((span) => span.textContent === "20"), "numbers colored");
+		// 开关按钮初始 on 态（描边示意）
+		assert.ok(view.model.els.syntaxBtn.classList.contains("on"), "toggle starts on");
+		view.destroy();
+	});
+
+	it("the syntax toggle switches highlighting off and back on (R21)", async () => {
+		resetStore();
+		const { view } = await mountViewer("src/app.ts");
+		view.model.els.syntaxBtn.click();
+		// 关态：无着色 span，行文本原样（旧行为）；按钮去 on
+		assert.ok(!view.model.els.syntaxBtn.classList.contains("on"));
+		for (const row of lineRowsOf(view.root)) {
+			// 关态 = 内容列只有原始文本节点（无着色 span；空行无子节点也算纯文本）
+			const content = collect(row.el, "gr-vcontent")[0];
+			assert.ok(content.childNodes.every((node) => typeof node === "string"), "off = plain text node(s) only");
+		}
+		assert.equal(lineRowsOf(view.root).find((row) => row.type === "add").text, "const b = 20;", "text survives the toggle");
+		// 再点：着色回来（同一渲染通道）
+		view.model.els.syntaxBtn.click();
+		assert.ok(collect(view.root, "gr-tok-kw").length > 0, "toggle re-enables coloring");
+		view.destroy();
+	});
+
+	it("preview mode stays plain (blob payloads have no path family mismatch) and empty files tokenize to nothing (R21)", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({ "/blob": blobRouteFor("alpha\nbeta\n") });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		// main.txt 无已知扩展名 → plain 家族（单一纯文本令牌）→ 无着色 span，旧行为
+		assert.equal(collect(view.root, "gr-tok-kw").length, 0);
+		assert.equal(lineRowsOf(view.root).length, 2);
+		view.destroy();
+	});
+
 	it("fold expansion is suppressed in preview mode (no collapse button, no fold rows)", async () => {
 		resetStore();
 		store.setSelection({ path: "main.txt", base: "main" });
@@ -1960,5 +2011,105 @@ describe("unchanged-file preview (R18: /blob chain)", () => {
 		assert.equal(collect(view.root, "gr-vfold").length, 0);
 		assert.ok(!collect(view.root, "gr-vbtn").some((btn) => btn.textContent === "折叠上下文"), "no collapse button in preview");
 		view.destroy();
+	});
+});
+
+/* ------------------------------------------------------------------ */
+/* R21：语法高亮分词器（client/syntax.mjs 纯逻辑）                       */
+/* ------------------------------------------------------------------ */
+
+describe("syntax highlighting tokenizer (R21)", () => {
+	it("maps file paths to token families by extension, basename specials stay plain-dot-safe", async () => {
+		const { langForPath } = await import("../client/syntax.mjs");
+		const cases = [
+			["src/app.ts", "js"],
+			["a/b/c.mjs", "js"],
+			["x.jsx", "js"],
+			["pkg.json", "json"],
+			["style.scss", "css"],
+			["index.html", "markup"],
+			["icon.svg", "markup"],
+			["README.md", "md"],
+			["main.go", "c"],
+			["lib.rs", "c"],
+			["App.java", "c"],
+			["app.py", "hash"],
+			["run.sh", "hash"],
+			["cfg.yaml", "hash"],
+			["query.sql", "sql"],
+			["notes.txt", "plain"],
+			["README", "plain"], // 无扩展名
+			[".gitignore", "plain"], // 点首不是扩展名
+			["Makefile", "hash"], // 基本名特判
+			["dockerfile", "hash"],
+			["MAKEFILE", "hash"], // 基本名特判大小写不敏感
+			["weird.unknownext", "plain"],
+			["", "plain"],
+			[undefined, "plain"],
+		];
+		for (const [path, want] of cases) assert.equal(langForPath(path), want, `langForPath(${JSON.stringify(path)})`);
+	});
+
+	it("tokenization partitions the line exactly (concatenation identity) across families", async () => {
+		const { tokenizeLine } = await import("../client/syntax.mjs");
+		const samples = [
+			["const a = 1; // init", "js"],
+			["const s = \"http://x\"; /* c */ const t = 0x1f;", "js"],
+			["function f() { return `t${1}`; }", "js"],
+			["if (x === 2) foo(bar(3));", "js"],
+			["{\"a\": 1, \"b\": [true, null]}", "json"],
+			["x = 1  # comment", "hash"],
+			["def main(): return (x,)", "hash"],
+			["SELECT a, COUNT(*) FROM t -- c", "sql"],
+			["int main(void) { printf(\"hi\"); return 0; }", "c"],
+			["#include <stdio.h>", "c"],
+			["<div id=\"x\" class=\"y\">text</div>", "markup"],
+			[".a { color: #fff; margin: 10px; /* c */ }", "css"],
+			["plain line, nothing to see", "plain"],
+		];
+		for (const [text, lang] of samples) {
+			const tokens = tokenizeLine(text, lang);
+			assert.equal(tokens.map((tok) => tok.text).join(""), text, `partition identity for ${lang}: ${text}`);
+			for (const tok of tokens) assert.ok(typeof tok.cls === "string", "cls is always a string");
+		}
+	});
+
+	it("scanning order: strings swallow // and #, keywords beat function-call coloring", async () => {
+		const { tokenizeLine } = await import("../client/syntax.mjs");
+		// 字符串里的双斜杠不产生注释令牌
+		const js = tokenizeLine("const s = \"http://x\";", "js");
+		assert.ok(js.every((tok) => tok.cls !== "com"), "url inside a string is not a comment");
+		assert.deepEqual(js.filter((tok) => tok.cls === "str").map((tok) => tok.text), ["\"http://x\""]);
+		// 注释里的引号不开启字符串
+		const js2 = tokenizeLine("const a = 1; // it's quoted \"inside\"", "js");
+		assert.equal(js2.filter((tok) => tok.cls === "com").length, 1);
+		assert.ok(js2.every((tok) => tok.cls !== "str" || !tok.text.includes("inside")), "quotes inside a comment do not open strings");
+		// 关键字调用（if( / while( ）按 kw 着色，不被 fn 备选抢走
+		const js3 = tokenizeLine("if (ok) while (go()) {", "js");
+		assert.deepEqual(js3.filter((tok) => tok.cls !== "").map((tok) => [tok.cls, tok.text]), [["kw", "if"], ["kw", "while"], ["fn", "go"]]);
+		// hash 家族：# 注释整体吞掉；行中井号前的 URL 不受影响的部分照旧
+		const py = tokenizeLine("x = 1  # comment 'quoted'", "hash");
+		assert.deepEqual(py.filter((tok) => tok.cls !== "").map((tok) => [tok.cls, tok.text]), [["num", "1"], ["com", "# comment 'quoted'"]]);
+		// json：后随冒号的字符串是 key，否则普通字符串
+		const j1 = tokenizeLine("{\"a\": 1}", "json");
+		assert.deepEqual(j1.filter((tok) => tok.cls !== "").map((tok) => [tok.cls, tok.text]), [["key", "\"a\""], ["num", "1"]]);
+		const j2 = tokenizeLine("[\"a\", \"b\"]", "json");
+		assert.deepEqual(j2.filter((tok) => tok.cls !== "").map((tok) => [tok.cls, tok.text]), [["str", "\"a\""], ["str", "\"b\""]]);
+	});
+
+	it("edge cases: empty lines, whitespace-only, unknown family, memo identity and cap", async () => {
+		const { tokenizeLine } = await import("../client/syntax.mjs");
+		assert.deepEqual(tokenizeLine("", "js"), []);
+		assert.deepEqual(tokenizeLine("   ", "js"), [{ cls: "", text: "   " }]);
+		assert.deepEqual(tokenizeLine("anything", "no-such-family"), [{ cls: "", text: "anything" }]);
+		// 同 (家族, 行文本) 记忆化命中 = 同一数组（数据不可变，渲染只读复用）
+		const first = tokenizeLine("const a = 1;", "js");
+		assert.equal(tokenizeLine("const a = 1;", "js"), first);
+		assert.notEqual(tokenizeLine("const a = 1;", "c"), first, "same text, different family → separate scan");
+		// 记忆化封顶：塞满后清空重来（不涨爆）
+		for (let i = 0; i < 5000; i++) tokenizeLine(`const v${i} = ${i};`, "js");
+		const rebuilt = tokenizeLine("const a = 1;", "js");
+		assert.notEqual(rebuilt, first, "cap eviction clears the memo");
+		assert.equal(rebuilt.map((tok) => tok.text).join(""), "const a = 1;");
 	});
 });

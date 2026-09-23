@@ -62,11 +62,17 @@
  * 两种空隙与 hunk 间空隙同一渲染、同一展开通道。补丁截断时两端都不画（最后的
  * 可见 hunk 未必真在文件边界）。
  *
+ * R21 语法高亮：内容列按扩展名家族分词着色（client/syntax.mjs 的单行正则分词
+ * 器；令牌拼接恒等原文，行文本本身不变 —— white-space:pre 语义、行命中模型、
+ * 评论标记全部不受影响）。默认开，头部按钮可关（关 = 纯文本节点，旧行为）。
+ * One Dark 色板（.gr-tok-*），未命中令牌留默认前景色。
+ *
  * 纯逻辑（折叠空隙计算、行模型、状态归类）导出为独立函数，node --test 用极小
  * 假 DOM + 桩 fetch 驱动整个视图（见 test/viewer.test.mjs；fixture 补丁文本
  * 一律经 Phase 1 的 parseUnifiedDiff 取行号 —— 与 git 输出同源）。
  */
 import { MAX_CONTEXT } from "./gitcore.mjs";
+import { langForPath, tokenizeLine } from "./syntax.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
 import { commentAnchorLabel } from "./store.mjs";
 import * as store from "./store.mjs";
@@ -100,6 +106,7 @@ export function foldGapBetween(prevHunk, nextHunk) {
 
 /** 文件起点虚锚（行 1、0 行）：与 foldGapBetween 组合算首个 hunk 之前的空隙（R20）。 */
 const LEADING_ANCHOR = { oldStart: 1, oldLines: 0, newStart: 1, newLines: 0 };
+let syntaxOn = true; // R21 语法高亮开关（模块级会话态，不持久化；头部按钮切换）
 
 /**
  * 结构化 /diff 载荷 → 渲染行模型（无 DOM）。序列：
@@ -228,6 +235,17 @@ export const VIEWER_CSS = `
 	border: 1px solid var(--gr-border); border-radius: 6px; padding: 2px 8px; flex: none; white-space: nowrap;
 }
 .gr-vbtn:hover { background: var(--gr-hover); }
+.gr-vbtn.on { color: var(--gr-accent); border-color: var(--gr-accent); }
+/* R21 语法高亮（One Dark 色板；默认开，头部按钮可关 —— 关 = 纯文本） */
+.gr-tok-com { color: #7f848e; font-style: italic; }
+.gr-tok-str { color: #98c379; }
+.gr-tok-num { color: #d19a66; }
+.gr-tok-kw { color: #c678dd; }
+.gr-tok-fn { color: #61afef; }
+.gr-tok-tag { color: #e06c75; }
+.gr-tok-attr { color: #d19a66; }
+.gr-tok-key { color: #e06c75; }
+.gr-tok-at { color: #c678dd; }
 .gr-vst {
 	flex: none; font-family: ui-monospace, Menlo, Consolas, monospace; font-weight: 700; font-size: 11px;
 	min-width: 13px; text-align: center;
@@ -530,6 +548,13 @@ export function createViewer(opts = {}) {
 		void refresh();
 	}
 
+	/** R21 头部「语法高亮」开关：模块级会话态翻转 + 全量重渲染（纯本地，零请求）。 */
+	function toggleSyntax() {
+		if (destroyed) return;
+		syntaxOn = !syntaxOn;
+		render();
+	}
+
 	/* ---- 行命中模型（Phase 4 消费；本阶段只做选中） ---- */
 
 	function getSelection() {
@@ -681,6 +706,13 @@ export function createViewer(opts = {}) {
 						}))
 					: (model.els.fileCommentBtn = undefined),
 				(model.els.refreshBtn = el("button", { class: "gr-vbtn", text: t("nav.refresh"), onclick: () => void refresh() })),
+				// R21 语法高亮开关（会话级；开态高亮描边示意当前开着）。
+				(model.els.syntaxBtn = el("button", {
+					class: `gr-vbtn gr-vsyntax${syntaxOn ? " on" : ""}`,
+					text: t("viewer.syntax"),
+					title: t("viewer.syntaxHint"),
+					onclick: () => toggleSyntax(),
+				})),
 				// R17：内嵌面板的还原入口（opts.onClose 注入才有）—— 点击由 inline 控制器
 				// 还原消息面板；全屏形态不传 onClose，头部与 Phase 4 完全一致。
 				typeof opts.onClose === "function"
@@ -856,7 +888,16 @@ export function createViewer(opts = {}) {
 		const covered = isLineCommented(line);
 		const mark = el("span", { class: "gr-vmark", text: covered ? "●" : "" });
 		// 内容列缺省锚 new 侧（R9），del 行（无 new）锚 old 侧 —— 两种行都可点。
-		const content = el("span", { class: "gr-vcontent", text: line.text ?? "" });
+		// R21 语法高亮：按扩展名家族分词着色（可关）。令牌拼接恒等原文 —— 行文本、
+		// white-space:pre 语义、行命中/评论标记都不受影响；关闭态 = 纯文本节点（旧行为）。
+		const content = el("span", { class: "gr-vcontent" });
+		if (syntaxOn) {
+			for (const tok of tokenizeLine(line.text ?? "", langForPath(payload?.path))) {
+				content.append(tok.cls ? el("span", { class: `gr-tok-${tok.cls}`, text: tok.text }) : tok.text);
+			}
+		} else {
+			content.textContent = line.text ?? "";
+		}
 		content.addEventListener("click", (event) => onLineClick(line, newNo !== null ? "new" : "old", event));
 		const rowEl = el("div", {
 			class: `gr-vline ${line.type}${isLineSelected(line) ? " selected" : ""}${covered ? " commented" : ""}`,
