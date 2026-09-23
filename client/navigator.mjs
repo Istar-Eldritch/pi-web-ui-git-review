@@ -31,6 +31,11 @@
  *
  * R19：目录级聚合增删 —— buildTree 条目支持 {path,add,del} 对象形态，目录行在
  * 右缘展示子树求和的 +add −del（与文件行同款计数列）；头部标题行展示全评审聚合。
+ *
+ * R24：文件筛选行 —— 工具条正上方一行输入框，输入即筛（纯客户端，不新增请求）：
+ * 对完整路径做大小写不敏感的子串匹配（rename 的 oldPath 也参与命中），树形/平铺、
+ * 仅变更/全树共用；筛选激活时忽略目录折叠态（匹配项可能在折叠的目录里），清除后
+ * 恢复折叠记忆。无匹配时给空态文案，不出现空白列表。
  */
 import { DEFAULT_BASE_CANDIDATES } from "./gitcore.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
@@ -187,6 +192,16 @@ export function buildTree(entries, isChanged = () => false) {
 }
 
 /**
+ * R24：文件筛选匹配 —— 完整路径的大小写不敏感子串匹配；查询为空/仅空白 = 不过滤。
+ * 树形/平铺、仅变更/全树四处清单共用同一条匹配语义。
+ */
+export function pathMatchesFilter(path, query) {
+	const q = String(query ?? "").trim().toLowerCase();
+	if (!q) return true;
+	return String(path ?? "").toLowerCase().includes(q);
+}
+
+/**
  * R19：行契约 add/del 的聚合 sum（头部全评审聚合用；截断时只覆盖已列出文件，
  * 与清单一致 —— 截断上限语义 R16 的 total 保全只针对条数）。
  */
@@ -275,6 +290,13 @@ export const NAVIGATOR_CSS = `
 .gr-seg { display: flex; border: 1px solid var(--gr-border); border-radius: 6px; overflow: hidden; }
 .gr-segbtn { font: inherit; font-size: 11.5px; cursor: pointer; color: var(--gr-dim); background: transparent; border: 0; padding: 3px 8px; white-space: nowrap; }
 .gr-segbtn.on { color: var(--text, #e6e8ef); background: var(--gr-soft); }
+/* R24：文件筛选行 —— 工具条正上方；输入即筛（树形/平铺、仅变更/全树共用）。 */
+.gr-filterrow { display: flex; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--gr-border); }
+.gr-filter-input {
+	flex: 1 1 auto; min-width: 0; font: inherit; font-size: 12px; color: inherit;
+	background: var(--bg, #0d0e12); border: 1px solid var(--gr-border); border-radius: 6px; padding: 3px 8px;
+}
+.gr-filter-input::placeholder { color: var(--gr-dim); }
 .gr-body { flex: 1 1 auto; overflow: auto; min-height: 0; }
 .gr-state { padding: 18px 12px; text-align: center; color: var(--gr-dim); display: flex; flex-direction: column; gap: 6px; align-items: center; }
 .gr-state-title { color: var(--text, #e6e8ef); font-weight: 600; }
@@ -426,11 +448,26 @@ export function createNavigator(opts = {}) {
 	let treeSeq = 0;
 	let pickerOpen = false;
 	const collapsed = new Set(); // 目录折叠（会话内即可，不持久化）
+	let filterText = ""; // R24 文件筛选（挂载局部；跨刷新保留，与 collapsed 同类）
+	let refocusFilter = false; // 筛选输入触发的重渲染 → 新输入框接回焦点（render 消费一次）
 	let uiNotice = null; // Phase 4 可见通知 { kind, text, copyable?, copyText?, messageText? }（只被新通知替换，卸载随之消失）
 	let submitting = false;
 	let submitter = null; // 兜底构建的提交流（opts.submitter 已注入时直接用）
 
 	const modes = () => store.getState().viewModes;
+
+	/** R24：筛选是否激活（仅空白的查询视为未筛选）。 */
+	const hasFilter = () => filterText.trim() !== "";
+
+	/**
+	 * R24：筛选行只在「确实在列文件清单」时出现（picker 打开 / 加载中 / 错误态 /
+	 * 空清单都不出现 —— 没有可筛的行就不占一行的位置）。
+	 */
+	function filterApplicable() {
+		if (pickerOpen || loading) return false;
+		if (modes().scope === "full") return Boolean(treeData && treeData.files.length);
+		return Boolean(review && review.files.length);
+	}
 
 	/* ---- HTTP ---- */
 	function apiUrl(path, params) {
@@ -558,6 +595,59 @@ export function createNavigator(opts = {}) {
 			])),
 		]);
 		return bar;
+	}
+
+	/**
+	 * R24：文件筛选行（工具条正上方）。输入即筛：重渲染后由 refocus 把焦点接回
+	 * 新输入框、光标挪到末尾（真 DOM；假 DOM 缺 focus/setSelectionRange 时安静
+	 * 跳过）。IME 组合中只记值不重渲染（重Render 会打断输入法候选），compositionend
+	 * 再统一筛。非空查询时附清除按钮。
+	 */
+	function renderFilterRow(refocus = false) {
+		const input = (model.els.filterInput = el("input", {
+			class: "gr-filter-input",
+			placeholder: t("nav.filter.placeholder"),
+			value: filterText,
+			dataset: { role: "filter" },
+		}));
+		input.addEventListener("input", (event) => {
+			filterText = input.value;
+			if (event?.isComposing) return; // IME 组合中：不重渲染
+			refocusFilter = true;
+			render();
+		});
+		input.addEventListener("compositionend", () => {
+			filterText = input.value;
+			refocusFilter = true;
+			render();
+		});
+		const row = el("div", { class: "gr-filterrow" }, [input]);
+		if (hasFilter()) {
+			row.append(
+				(model.els.filterClearBtn = el("button", {
+					class: "gr-btn gr-filter-clear",
+					text: "✕",
+					title: t("nav.filter.clear"),
+					onclick: () => {
+						filterText = "";
+						refocusFilter = true;
+						render();
+					},
+				})),
+			);
+		}
+		if (refocus) {
+			try {
+				if (typeof input.focus === "function") input.focus();
+				if (typeof input.setSelectionRange === "function") {
+					const end = input.value.length;
+					input.setSelectionRange(end, end);
+				}
+			} catch {
+				/* 焦点/选区不可用（假 DOM 等）→ 忽略 */
+			}
+		}
+		return row;
 	}
 
 	/** 选中并打开（R7/R17/R18 共用入口）：{path, base} 原子写入共享 store（viewer
@@ -722,9 +812,18 @@ export function createNavigator(opts = {}) {
 	}
 
 	function renderChangedList() {
-		const files = review?.files ?? [];
 		const box = el("div", { class: "gr-list" });
 		model.rows = [];
+		// R24：筛选先于建树/建行 —— 树模式下没有匹配文件的目录自然被剪掉；rename 的
+		// 旧路径（行上可见的「old → new」文案）也参与命中。
+		const files = (review?.files ?? []).filter(
+			(f) => pathMatchesFilter(f.path, filterText) || pathMatchesFilter(f.oldPath, filterText),
+		);
+		if (hasFilter() && files.length === 0) {
+			return stateBox(t("nav.filter.empty", { q: filterText.trim() }));
+		}
+		// 筛选激活时忽略折叠态（匹配项可能在折叠的目录里；清除筛选后恢复折叠记忆）。
+		const collapsedSet = hasFilter() ? new Set() : collapsed;
 		const fileMap = new Map(files.map((f) => [f.path, f]));
 		if (modes().layout === "tree") {
 			// R19：目录级聚合增删 —— 树条目用对象形态把行数带进 buildTree（子树求和）。
@@ -732,8 +831,10 @@ export function createNavigator(opts = {}) {
 				files.map((f) => ({ path: f.path, add: f.add, del: f.del })),
 				() => true,
 			);
-			for (const n of flattenTree(nodes, collapsed)) {
-				if (n.kind === "dir") box.append(dirRow(n, collapsed));
+			for (const n of flattenTree(nodes, collapsedSet)) {
+				// R24：caret 用生效集 —— 筛选中目录全展开，箭头也如实展示 ▾（点击仍写回
+				// 真实 collapsed，记忆不丢）。
+				if (n.kind === "dir") box.append(dirRow(n, collapsedSet));
 				else {
 					const file = fileMap.get(n.path);
 					const row = fileRow(file, { depth: n.depth, selected: store.getState().selectedPath === n.path });
@@ -772,17 +873,25 @@ export function createNavigator(opts = {}) {
 		const fileMap = new Map((review?.files ?? []).map((f) => [f.path, f]));
 		const box = el("div", { class: "gr-list" });
 		model.rows = [];
+		// R24：全树同样先筛再建树（纯客户端；无匹配给空态而不是空白列表）。
+		const files = treeData.files.filter((p) => pathMatchesFilter(p, filterText));
+		if (hasFilter() && files.length === 0) {
+			return stateBox(t("nav.filter.empty", { q: filterText.trim() }));
+		}
+		// 筛选激活时忽略折叠态（同仅变更树；清除筛选后恢复折叠记忆）。
+		const collapsedSet = hasFilter() ? new Set() : collapsed;
 		// R19：变更文件用对象形态带行数（目录级聚合增删照常展示），未变更文件保持字符串。
 		const nodes = buildTree(
-			treeData.files.map((p) => {
+			files.map((p) => {
 				const f = fileMap.get(p);
 				return f ? { path: p, add: f.add, del: f.del } : p;
 			}),
 			(p) => changedSet.has(p),
 		);
-		for (const n of flattenTree(nodes, collapsed)) {
+		for (const n of flattenTree(nodes, collapsedSet)) {
+			// R24：caret 用生效集（筛选中全展开 → 箭头如实 ▾；点击仍写回真实 collapsed）。
 			if (n.kind === "dir") {
-				box.append(dirRow(n, collapsed));
+				box.append(dirRow(n, collapsedSet));
 				continue;
 			}
 			const file = fileMap.get(n.path);
@@ -928,7 +1037,12 @@ export function createNavigator(opts = {}) {
 		model.rows = [];
 		model.notice = null;
 		root.textContent = "";
-		root.append(renderHead(), renderToolbar(), renderSummarySection());
+		const refocus = refocusFilter; // 筛选输入触发的本轮 → 消费一次（见 renderFilterRow）
+		refocusFilter = false;
+		root.append(renderHead());
+		// R24：筛选行在工具条正上方；没有可筛的清单时整个行都不出现。
+		if (filterApplicable()) root.append(renderFilterRow(refocus));
+		root.append(renderToolbar(), renderSummarySection());
 		const body = el("div", { class: "gr-body" });
 		body.append(renderBody());
 		root.append(body);

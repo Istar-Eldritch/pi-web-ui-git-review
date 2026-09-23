@@ -61,6 +61,11 @@ export const DICT = {
 		"nav.flag.unstaged": "未暂存",
 		"nav.tree.changedCount": "+{n}",
 
+		// R24：文件筛选行（工具条正上方；树形/平铺、仅变更/全树共用；纯客户端过滤）。
+		"nav.filter.placeholder": "筛选文件…",
+		"nav.filter.clear": "清除筛选",
+		"nav.filter.empty": "没有匹配「{q}」的文件",
+
 		// Phase 4（R9/R10/R11）：徽标、评审摘要、提交动作与可见通知。
 		// 注意：R11 组装文本本身是固定英文契约（agent 契约，见 README），不在字典里。
 		"nav.commentBadge.title": "{n} 条评论草稿",
@@ -183,6 +188,11 @@ export const DICT = {
 		"nav.flag.staged": "staged",
 		"nav.flag.unstaged": "unstaged",
 		"nav.tree.changedCount": "+{n}",
+
+		// R24: file filter row (directly above the toolbar; shared by tree/flat and changed/full; client-side only).
+		"nav.filter.placeholder": "Filter files…",
+		"nav.filter.clear": "Clear filter",
+		"nav.filter.empty": "No files match \"{q}\"",
 
 		// Phase 4 (R9/R10/R11): badge, review summary, submit action, visible notices.
 		// Note: the R11 assembled message itself is the fixed English agent contract

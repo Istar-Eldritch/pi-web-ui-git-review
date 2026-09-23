@@ -6,7 +6,8 @@
  *   2. 整个视图用**极小假 DOM**（约 80 行，createElement/append/classList/textContent/
  *      addEventListener/value 的最小面）+ 桩 fetch 服务端（Phase 1 路由契约形态）
  *      驱动：行渲染、两个开关 + localStorage 持久化、基线选择器（分支/提交/手动）、
- *      状态机（空评审、截断、非仓库、stale marker、无基线、通用错误）、清理。
+ *      状态机（空评审、截断、非仓库、stale marker、无基线、通用错误）、
+ *      文件筛选（R24）、清理。
  *
  * 全局桩次序：假环境收口在 test/fake-env.mjs（与 viewer 套件共享同一份 ——
  * 两个套件被 test/index.js import 进**同一进程**，各装一份全局桩会互相打掉，
@@ -424,6 +425,182 @@ describe("navigator toggles (tree/flat and changed/full)", () => {
 		collect(view.root, "gr-segbtn").find((button) => button.textContent === "仅变更").click();
 		await view.refresh();
 		assert.deepEqual(rowsOf(view.root).map((row) => row.path), REVIEW_FILES.map((file) => file.path));
+		view.destroy();
+	});
+});
+
+/* ------------------------------------------------------------------ */
+/* 文件筛选（R24）                                                       */
+/* ------------------------------------------------------------------ */
+
+describe("navigator file filter (R24)", () => {
+	it("pathMatchesFilter: case-insensitive full-path substring; blank query passes all", () => {
+		assert.equal(navModule.pathMatchesFilter("client/Viewer.mjs", "viewer"), true);
+		assert.equal(navModule.pathMatchesFilter("client/Viewer.mjs", "VIEWER.MJS"), true);
+		assert.equal(navModule.pathMatchesFilter("client/Viewer.mjs", "nope"), false);
+		assert.equal(navModule.pathMatchesFilter("client/Viewer.mjs", ""), true);
+		assert.equal(navModule.pathMatchesFilter("client/Viewer.mjs", "   "), true); // 仅空白 = 不过滤
+		assert.equal(navModule.pathMatchesFilter(null, "x"), false);
+		assert.equal(navModule.pathMatchesFilter(undefined, ""), true);
+	});
+
+	it("renders the filter row above the toolbar only when a list is present", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		const row = collect(view.root, "gr-filterrow")[0];
+		assert.ok(row, "filter row renders for a loaded review");
+		// 位置：紧跟头部之后、工具条之前
+		const kids = view.root.childNodes.filter((n) => typeof n !== "string");
+		assert.ok(kids[0].classList.contains("gr-head"));
+		assert.equal(kids.indexOf(row), 1);
+		assert.ok(kids[2].classList.contains("gr-toolbar"));
+		assert.equal(view.model.els.filterInput.value, "");
+		assert.equal(view.model.els.filterInput.getAttribute("placeholder"), "筛选文件…");
+		assert.equal(collect(view.root, "gr-filter-clear").length, 0); // 空筛选无清除按钮
+		view.destroy();
+
+		// 空评审 → 无清单可筛 → 行不出现
+		resetStore();
+		const empty = await mountNavigator(
+			standardRoutes({
+				"/review": { ok: true, base: { ref: "main", sha: SHA_BASE, source: "marker" }, files: [], total: 0, truncated: false },
+			}),
+		);
+		assert.equal(collect(empty.view.root, "gr-filterrow").length, 0);
+		empty.view.destroy();
+
+		// 错误态 → 无清单 → 行不出现
+		resetStore();
+		const failing = await mountNavigator(standardRoutes({ "/review": { ok: false, error: "boom" } }));
+		assert.equal(collect(failing.view.root, "gr-filterrow").length, 0);
+		failing.view.destroy();
+
+		// 加载中 → 行不出现；装载完成后出现
+		resetStore();
+		let releaseReview;
+		const gated = standardRoutes({
+			"/review": () =>
+				new Promise((resolve) => {
+					releaseReview = () => resolve(standardRoutes()["/review"]);
+				}),
+		});
+		const gatedServer = createStubServer(gated);
+		const gatedView = navModule.createNavigator({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: gatedServer.fetchImpl,
+			lang: "zh",
+		});
+		const gatedRefresh = gatedView.refresh(); // 同步渲染出加载态
+		assert.equal(collect(gatedView.root, "gr-filterrow").length, 0);
+		// /review 在 marker/refs/commits 的微任务之后才发出 —— 先等 gate 挂上再放行
+		await assertEventually(() => typeof releaseReview === "function", "/review must be gated in flight");
+		releaseReview();
+		await gatedRefresh;
+		assert.equal(collect(gatedView.root, "gr-filterrow").length, 1);
+		gatedView.destroy();
+	});
+
+	it("hides the filter row while the base picker is open", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		assert.equal(collect(view.root, "gr-filterrow").length, 1);
+		view.model.els.changeBaseBtn.click();
+		assert.equal(collect(view.root, "gr-filterrow").length, 0);
+		view.destroy();
+	});
+
+	it("filters the flat changed list live; matches rename oldPath too; survives re-render", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		view.model.els.filterInput.value = "DIR"; // 大小写不敏感
+		view.model.els.filterInput.dispatch("input");
+		assert.deepEqual(rowsOf(view.root).map((row) => row.path), ["dir/new.txt"]);
+		// 重渲染后 model.els.filterInput 是新元素，值被恢复
+		assert.equal(view.model.els.filterInput.value, "DIR");
+
+		// rename 旧路径（行上可见的 old → new 文案）也参与命中
+		view.model.els.filterInput.value = "old.txt";
+		view.model.els.filterInput.dispatch("input");
+		assert.deepEqual(rowsOf(view.root).map((row) => row.path), ["dir/new.txt"]);
+		view.destroy();
+	});
+
+	it("shows a no-match state and restores everything via the clear button", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		view.model.els.filterInput.value = "zzz";
+		view.model.els.filterInput.dispatch("input");
+		assert.equal(rowsOf(view.root).length, 0);
+		assert.ok(
+			collect(view.root, "gr-state")[0].textContent.includes("zzz"),
+			"no-match state names the query",
+		);
+		// 行还在筛时清除按钮可点；恢复全量后按钮消失
+		const clear = view.model.els.filterClearBtn;
+		assert.ok(clear, "clear button shows while a filter is active");
+		clear.click();
+		assert.deepEqual(rowsOf(view.root).map((row) => row.path), REVIEW_FILES.map((file) => file.path));
+		assert.equal(view.model.els.filterInput.value, "");
+		assert.equal(collect(view.root, "gr-filter-clear").length, 0);
+		view.destroy();
+	});
+
+	it("filters the tree layout, auto-expands collapsed dirs while filtering, restores collapse on clear", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "树").click();
+		// 折叠 dir/
+		collect(view.root, "gr-dirrow").find((row) => row.dataset.dir === "dir").click();
+		assert.equal(rowsOf(view.root).some((row) => row.path === "dir/new.txt"), false);
+
+		// 筛选：匹配项在折叠目录里也可见（筛选激活 = 全展开，caret 同步如实 ▾）
+		view.model.els.filterInput.value = "new.txt";
+		view.model.els.filterInput.dispatch("input");
+		assert.ok(rowsOf(view.root).some((row) => row.path === "dir/new.txt"), "filter auto-expands collapsed dirs");
+		assert.equal(rowsOf(view.root).length, 1); // 只剩匹配子树
+		assert.ok(collect(view.root, "gr-dirrow").every((row) => row.dataset.dir === "dir"));
+
+		// 清除 → 恢复折叠记忆：dir/ 重新折叠
+		view.model.els.filterClearBtn.click();
+		assert.equal(rowsOf(view.root).some((row) => row.path === "dir/new.txt"), false);
+		assert.ok(collect(view.root, "gr-dirrow").some((row) => row.dataset.dir === "dir"));
+		view.destroy();
+	});
+
+	it("filters the full tree without refetching /tree", async () => {
+		resetStore();
+		const { view, server } = await mountNavigator(standardRoutes(), { openFile: () => {} });
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "全树").click();
+		await assertEventually(() => rowsOf(view.root).some((row) => row.path === "readme.md"), "full tree must render");
+		const treeCalls = server.calls.filter((call) => call.route === "/tree").length;
+
+		view.model.els.filterInput.value = "readme";
+		view.model.els.filterInput.dispatch("input");
+		assert.deepEqual(rowsOf(view.root).map((row) => row.path), ["readme.md"]);
+
+		// 无匹配 → 空态文案
+		view.model.els.filterInput.value = "zzz";
+		view.model.els.filterInput.dispatch("input");
+		assert.ok(collect(view.root, "gr-state").some((box) => box.textContent.includes("zzz")));
+
+		// 筛选是纯客户端的：/tree 调用数不变
+		assert.equal(server.calls.filter((call) => call.route === "/tree").length, treeCalls);
+		view.destroy();
+	});
+
+	it("defers re-render during IME composition until compositionend", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		const input = view.model.els.filterInput;
+		input.value = "keep";
+		input.dispatch("input", { isComposing: true });
+		// 组合中：不重渲染 —— 列表保持全量、输入框元素未重建
+		assert.equal(rowsOf(view.root).length, REVIEW_FILES.length);
+		assert.equal(view.model.els.filterInput, input);
+		// 组合结束 → 统一筛
+		input.dispatch("compositionend");
+		assert.deepEqual(rowsOf(view.root).map((row) => row.path), ["keep.txt"]);
 		view.destroy();
 	});
 });
