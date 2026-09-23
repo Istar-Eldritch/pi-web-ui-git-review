@@ -497,6 +497,13 @@ describe("viewer pure helpers", () => {
 		assert.equal(viewerModule.describeViewerState({ hunks: [{ lines: [] }], preview: true }).mode, "preview");
 		assert.equal(viewerModule.describeViewerState({ hunks: [], preview: true }).mode, "preview");
 		assert.equal(viewerModule.describeViewerState({ hunks: [], preview: true, binary: true }).mode, "binary");
+		// R22：未跟踪预览载荷同时带 preview 与 untracked —— preview 优先，否则没有
+		// 内容态可渲染；不带 preview 的 untracked 照旧是空态。
+		assert.equal(viewerModule.describeViewerState({ hunks: [], preview: true, untracked: true }).mode, "preview");
+		// R22：二进制注记键三分类（变更 / 未变更预览 / 未跟踪预览）
+		assert.equal(viewerModule.binaryNoteKey({ binary: true }), "viewer.kind.binary");
+		assert.equal(viewerModule.binaryNoteKey({ binary: true, preview: true }), "viewer.kind.binaryPreview");
+		assert.equal(viewerModule.binaryNoteKey({ binary: true, preview: true, untracked: true }), "viewer.kind.binaryUntracked");
 		assert.equal(viewerModule.describeViewerState({ hunks: [{ lines: [] }], truncated: true }).truncated, true);
 		assert.deepEqual(viewerModule.describeViewerState(null), { mode: "rows", newFile: false, deleted: false, renamed: false, truncated: false });
 	});
@@ -689,8 +696,8 @@ describe("viewer special file kinds (R8)", () => {
 		view.destroy();
 	});
 
-	it("untracked file: untracked:true zero hunks → no-diff state (phase-1 contract)", async () => {
-		const { view } = await mountViewer("untracked.txt");
+	it("untracked file: zero hunks fall back to the no-diff state when /blob fails (R22 fallback)", async () => {
+		const { view } = await mountViewer("untracked.txt"); // 无 /blob 桩 → 链腿 404
 		assert.equal(lineRowsOf(view.root).length, 0);
 		assert.deepEqual(stateBoxesOf(view.root), ["未跟踪文件还没有 diff该文件尚未被 git 跟踪；加入暂存或提交后，这里会显示它的 diff。"]);
 		view.destroy();
@@ -1874,10 +1881,12 @@ describe("unchanged-file preview (R18: /blob chain)", () => {
 		view.destroy();
 	});
 
-	it("untracked files never chain into /blob (untracked state stands)", async () => {
+	it("untracked files chain into /blob and preview the working-tree content (R22)", async () => {
 		resetStore();
 		store.setSelection({ path: "untracked.txt", base: "main" });
-		const server = createStubServer({});
+		const server = createStubServer({
+			"/blob": blobRouteFor("alpha\nbeta\n", { path: "untracked.txt", untracked: true }),
+		});
 		const view = viewerModule.createViewer({
 			document: new FakeDocument(),
 			apiBase: "/plugins-api/git-review",
@@ -1885,10 +1894,274 @@ describe("unchanged-file preview (R18: /blob chain)", () => {
 			lang: "zh",
 		});
 		await view.refresh();
-		assert.ok(!server.calls.some((call) => call.route === "/blob"), "untracked short-circuits the blob leg");
-		assert.ok(stateBoxesOf(view.root).some((text) => text.includes("未跟踪文件")));
+		assert.ok(server.calls.some((call) => call.route === "/blob"), "untracked zero-hunk diff chains into /blob");
+		assert.deepEqual(
+			lineRowsOf(view.root).map((row) => [row.old, row.new, row.type, row.text]),
+			[[1, 1, "ctx", "alpha"], [2, 2, "ctx", "beta"]],
+			"working-tree content renders as all-context rows",
+		);
+		assert.equal(collect(view.root, "gr-vhunkhead").length, 0, "preview mode, no hunk headers");
+		assert.ok(notesOf(view.root).some((note) => note.includes("未跟踪文件")), "untracked preview note, not the R18 unchanged wording");
+		assert.ok(!notesOf(view.root).some((note) => note.includes("未变更文件")));
+		assert.ok(!stateBoxesOf(view.root).some((text) => text.includes("还没有 diff")), "the dead-end no-diff state is gone");
 		view.destroy();
 	});
+
+	it("untracked binary preview gets its own wording (not 'unchanged binary')", async () => {
+		resetStore();
+		store.setSelection({ path: "untracked.txt", base: "main" });
+		const server = createStubServer({
+			"/blob": blobRouteFor("", { path: "untracked.txt", untracked: true, binary: true, hunks: [] }),
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(stateBoxesOf(view.root).some((text) => text.includes("未跟踪的二进制文件")), "untracked wording, not 'unchanged'");
+		assert.ok(!stateBoxesOf(view.root).some((text) => text.includes("未变更的二进制文件")));
+		view.destroy();
+	});
+
+	// R23：嵌在本套件尾部 —— Markdown 渲染视图（预览态专属开关）。
+	describe("markdown rendered view (R23: preview-mode toggle)", () => {
+	const MD_TEXT = "# Title\n\nSome **bold** and `code`.\n\n- one\n- two\n";
+
+	/** renderOn 是模块级会话态 —— 用一个 md 预览挂载把开关归一回关态（非 md 挂载
+	 *  没有渲染按钮，归一不了；预览态的 refresh 也不会触发懒取）。 */
+	async function normalizeRenderOff() {
+		resetStore();
+		store.setSelection({ path: "notes.md", base: "main" });
+		const server = createStubServer({ "notes.md": mdDiffRoute, "/blob": blobRouteFor("x", { path: "notes.md" }) });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		if (view.model.els.renderBtn?.classList.contains("on")) view.model.els.renderBtn.click();
+		view.destroy();
+	}
+
+	/** md 路径的零 hunk 范围外 /diff（链进 /blob 用，同 main.txt 的形状）。 */
+	const mdDiffRoute = () => ({
+		ok: true,
+		path: "notes.md",
+		base: { ref: "main", sha: SHA_BASE, source: "marker" },
+		head: { sha: SHA_HEAD },
+		binary: false,
+		truncated: false,
+		hunks: [],
+	});
+
+	it("md preview shows the toggle; on → rendered container replaces the row grid, off → back", async () => {
+		resetStore();
+		store.setSelection({ path: "notes.md", base: "main" });
+		const server = createStubServer({ "notes.md": mdDiffRoute, "/blob": blobRouteFor(MD_TEXT, { path: "notes.md" }) });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(view.model.els.renderBtn, "toggle present for an md preview");
+		assert.ok(!view.model.els.renderBtn.classList.contains("on"), "starts raw");
+		assert.ok(collect(view.root, "gr-vdiff").length > 0, "rows grid initially");
+
+		view.model.els.renderBtn.click();
+		const rendered = collect(view.root, "gr-vmd");
+		assert.equal(rendered.length, 1, "rendered container replaces the grid");
+		assert.equal(collect(view.root, "gr-vdiff").length, 0, "row grid gone in rendered mode");
+		assert.ok(rendered[0].textContent.includes("Title"), "heading text lands");
+		assert.ok(rendered[0].textContent.includes("bold"), "inline content lands");
+		assert.ok(notesOf(view.root).some((note) => note.includes("渲染视图")), "read-only hint note");
+		assert.ok(view.model.els.renderBtn.classList.contains("on"));
+
+		view.model.els.renderBtn.click();
+		assert.ok(collect(view.root, "gr-vdiff").length > 0, "raw rows return");
+		assert.equal(collect(view.root, "gr-vmd").length, 0);
+		view.destroy();
+	});
+
+	it("toggling into the rendered view clears the line selection (row editor closes with it)", async () => {
+		resetStore();
+		store.setSelection({ path: "notes.md", base: "main" });
+		const server = createStubServer({ "notes.md": mdDiffRoute, "/blob": blobRouteFor(MD_TEXT, { path: "notes.md" }) });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		// renderOn 是模块级会话态（同 syntaxOn）—— 前序用例可能把它留在开态，先归一到原文。
+		if (view.model.els.renderBtn.classList.contains("on")) view.model.els.renderBtn.click();
+		const row = lineRowsOf(view.root)[0];
+		hotCellOf(row, "new").click();
+		assert.ok(view.getSelection(), "line selected in raw preview");
+		view.model.els.renderBtn.click();
+		assert.equal(view.getSelection(), null, "anchors do not survive a grid-less view");
+		view.destroy();
+	});
+
+	it("no toggle for non-markdown previews or non-md diff rows (diff-mode md: see R23 extension tests)", async () => {
+		// .txt 预览（R18 形态）：有全文但不是 markdown → 无开关。
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({ "/blob": blobRouteFor("plain text\n") });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(!view.model.els.renderBtn, "txt preview has no render toggle");
+		view.destroy();
+
+		// diff 行态的非 md 文件照旧无开关；变更的 md（R23 扩展）有开关，见下套件。
+		resetStore();
+		store.setSelection({ path: "src/app.ts", base: "main" });
+		const server2 = createStubServer({});
+		const view2 = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server2.fetchImpl,
+			lang: "zh",
+		});
+		await view2.refresh();
+		assert.ok(!view2.model.els.renderBtn, "non-md diff rows have no render toggle");
+		view2.destroy();
+	});
+
+	it("changed md: toggle fetches /blob?side=new, renders the new side, caches across toggles", async () => {
+		await normalizeRenderOff();
+
+		resetStore();
+		store.setSelection({ path: "notes.md", base: "main" });
+		const blobCalls = [];
+		const server = createStubServer({
+			"notes.md": () => payloadFromPatch(MODIFIED_PATCH, "notes.md"),
+			"/blob": (query) => {
+				blobCalls.push({ ...query });
+				return query.side === "new" ? blobRouteFor(MD_TEXT, { path: "notes.md", side: "new" })() : { ok: false, error: "old side not needed" };
+			},
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(view.model.els.renderBtn, "changed md gets the toggle (R23 extension)");
+		assert.ok(collect(view.root, "gr-vdiff").length > 0, "raw rows initially");
+
+		view.model.els.renderBtn.click();
+		assert.ok(stateBoxesOf(view.root).some((x) => x.includes("正在载入")), "loading state right after click");
+		await assertEventually(() => collect(view.root, "gr-vmd").length === 1, "rendered view arrives");
+		// R20 的尾部折叠总数也会打一次无 side 的 /blob —— 只断言 side=new 的调用。
+		assert.deepEqual(
+			blobCalls.filter((q) => q.side === "new"),
+			[{ path: "notes.md", base: "main", side: "new" }],
+			"exactly one side=new fetch",
+		);
+		assert.ok(collect(view.root, "gr-vmd")[0].textContent.includes("Title"), "new-side content renders");
+
+		// 切回原文再切进：缓存命中，零新请求。
+		view.model.els.renderBtn.click();
+		assert.ok(collect(view.root, "gr-vdiff").length > 0, "raw rows return");
+		const newSideCallsAfterFirst = blobCalls.filter((q) => q.side === "new").length;
+		view.model.els.renderBtn.click();
+		await assertEventually(() => collect(view.root, "gr-vmd").length === 1, "cached payload renders");
+		assert.equal(blobCalls.filter((q) => q.side === "new").length, newSideCallsAfterFirst, "no refetch on cache hit");
+		view.destroy();
+	});
+
+	it("changed md: refresh invalidates the cache and refetches side=new", async () => {
+		resetStore();
+		store.setSelection({ path: "notes.md", base: "main" });
+		const blobCalls = [];
+		let blobText = MD_TEXT;
+		const server = createStubServer({
+			"notes.md": () => payloadFromPatch(MODIFIED_PATCH, "notes.md"),
+			"/blob": (query) => {
+				blobCalls.push({ ...query });
+				return query.side === "new" ? blobRouteFor(blobText, { path: "notes.md", side: "new" })() : { ok: false, error: "old side not needed" };
+			},
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		if (!view.model.els.renderBtn.classList.contains("on")) view.model.els.renderBtn.click();
+		await assertEventually(() => collect(view.root, "gr-vmd").length === 1, "rendered");
+		const callsBefore = blobCalls.length;
+
+		blobText = "# Changed\n\nnew content\n"; // 工作区变了
+		await view.refresh();
+		await assertEventually(
+			() => collect(view.root, "gr-vmd").length === 1 && collect(view.root, "gr-vmd")[0].textContent.includes("Changed"),
+			"refresh refetched and re-rendered the new content",
+		);
+		assert.ok(blobCalls.length > callsBefore, "side=new was refetched after refresh");
+		view.destroy();
+	});
+
+	it("changed md: side=new failure shows an error box, not the diff error state; raw rows survive toggling off", async () => {
+		await normalizeRenderOff();
+
+		resetStore();
+		store.setSelection({ path: "notes.md", base: "main" });
+		const server = createStubServer({
+			"notes.md": () => payloadFromPatch(MODIFIED_PATCH, "notes.md"),
+			"/blob": (query) => (query.side === "new" ? { ok: false, error: "deleted from the working tree" } : { ok: false, error: "x" }),
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		view.model.els.renderBtn.click();
+		await assertEventually(
+			() => stateBoxesOf(view.root).some((x) => x.includes("deleted from the working tree")),
+			"server error surfaces in the render error box",
+		);
+		assert.ok(collect(view.root, "gr-vline").length === 0, "no rows while the rendered view errors");
+		view.model.els.renderBtn.click();
+		assert.ok(collect(view.root, "gr-vdiff").length > 0, "raw rows fully intact after failure");
+		assert.ok(!stateBoxesOf(view.root).some((x) => x.includes("deleted from the working tree")));
+		view.destroy();
+	});
+
+	it("deleted md gets no toggle (the new side is empty — nothing to render)", async () => {
+		await normalizeRenderOff();
+
+		resetStore();
+		store.setSelection({ path: "deleted.md", base: "main" });
+		const server = createStubServer({
+			"deleted.md": () => payloadFromPatch(DELETED_PATCH, "deleted.md"),
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.ok(!view.model.els.renderBtn, "deleted file: no render toggle");
+		view.destroy();
+	});
+});
 
 	it("binary preview renders the binary state with preview wording and no line rows", async () => {
 		resetStore();

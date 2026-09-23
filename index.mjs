@@ -40,12 +40,17 @@
  *                          二进制（NUL 探测）→ binary:true + 无行（只留文件级评论）；
  *                          超 MAX_PATCH_CHARS 截尾 truncated:true；路径不在基线 →
  *                          {ok:false,error}（客户端保留 /diff 的范围外空态）。
+ *                          R22 未跟踪腿：git show 拿不到的路径若被 porcelain 列为
+ *                          `??`（未跟踪，工作区独有）→ 改读工作树全文做同样的预览，
+ *                          载荷另带 untracked:true；不是未跟踪 → 按原错误照旧失败。
  *
  * 每条失败路径都是结构化 `{ ok:false, error }`（R13）：不是 git 仓库、未知/非法
  * base、stale marker、非法参数……一律可恢复错误，绝不抛穿。HTTP 状态保持 200，
  * 由客户端看 ok 字段（与宿主 notes 插件同口径）。
  */
 import { execFile } from "node:child_process";
+import { open } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import {
 	DEFAULT_BASE_CANDIDATES,
@@ -70,7 +75,7 @@ import {
 const execGitRaw = promisify(execFile);
 
 /* ------------------------------------------------------------------ */
-/* R18 预览助手（服务端专属，刻意不进 client/gitcore.mjs —— 见该文件尾注：  */
+/* R18/R22 预览助手（服务端专属，刻意不进 client/gitcore.mjs —— 见该文件尾注：*/
 /* 宿主插件 reload 只击穿 index.mjs 的 ESM 缓存，共享模块的新导出会让       */
 /* 重新激活直接失败。这里只放服务端消费的逻辑，node --test 从本文件导入。    */
 /* ------------------------------------------------------------------ */
@@ -112,6 +117,28 @@ export function previewHunks(text) {
 		truncated,
 		hunks: [{ oldStart: 1, oldLines: n, newStart: 1, newLines: n, lines: lines.map((line, i) => ({ type: "ctx", old: i + 1, new: i + 1, text: line })) }],
 	};
+}
+
+/**
+ * R22：未跟踪文件的工作树全文（/blob 的未跟踪腿内容源）。git show / git diff 都
+ * 拿不到未跟踪文件（git 的世界里它还不存在），唯一内容源就是工作树本身 —— 直接
+ * fs 读。护栏：路径已过 validatePath（仓库根相对、禁 `..`、禁绝对路径，与 git
+ * pathspec 同一套校验），且调用方已用 porcelain 确认它是 `??` 未跟踪条目。只读
+ * 文件头 MAX_GIT_OUTPUT 字节（与 git 子命令输出上限同量纲，previewHunks 之后还会
+ * 在 MAX_PATCH_CHARS 处再截并置 truncated）—— 不把可能巨大的未跟踪日志整读进内存。
+ * 按字节窗口解码与 execFile 的 utf8 解码同口径；窗口边缘的多字节字符可能成替换符
+ * （与 16MB 输出截断的既有语义同类）。符号链接会被跟随读穿 —— 与终端里 cat 一个
+ * 未跟踪符号链接同级 exposure，不做额外拦截。
+ */
+async function readWorkingFileCapped(root, relPath) {
+	const fh = await open(join(root, relPath), "r");
+	try {
+		const buf = Buffer.alloc(MAX_GIT_OUTPUT);
+		const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+		return buf.subarray(0, bytesRead).toString("utf8");
+	} finally {
+		await fh.close();
+	}
 }
 
 /** R14：只放行白名单内的只读 git 子命令（diff/log/status/ls-files/rev-parse/
@@ -415,19 +442,92 @@ async function diffPayload(host, root, rawBase, rawPath, rawContext) {
  *  merge-base 语义；`git show <merge-base>:<path>` 读全文 —— 未变更文件在基线、
  *  HEAD 与工作树三处内容一致（否则它就在 /diff 范围内了），所以基线内容即可
  *  评论的行号口径。路径不在基线（另一分支新增的文件/已删文件）→ git 报错 →
- *  withRepo 落 {ok:false,error}，客户端保留 /diff 的范围外空态。 */
-async function blobPayload(host, root, rawBase, rawPath) {
+ *  withRepo 落 {ok:false,error}，客户端保留 /diff 的范围外空态。
+ *
+ *  R23 side=new：变更文件「新侧」全文（Markdown 渲染视图用，客户端按需懒取）。
+ *  新侧 = 工作树内容（未提交改动是评审的主要对象，与 /diff 的 + 行同源）；
+ *  工作树干净但基线后有提交 → HEAD 内容；工作树里已删 → 结构化报错（没内容可
+ *  渲染）。porcelain 一次查询定位该路径的状态（?? / 有改动 / 无条目三分类）。 */
+async function blobPayload(host, root, rawBase, rawPath, rawSide) {
 	const base = await resolveBase(host, root, rawBase);
 	const path = validatePath(String(rawPath ?? ""));
 	const headSha = await revParseCommit(root, "HEAD");
+	if (String(rawSide ?? "") === "new") return blobPayloadNewSide(root, path, base, headSha);
 	const mb = await mergeBaseWithHead(root, base.sha, base.ref);
-	const raw = await git(root, ["show", `${mb}:${path}`]);
+	let raw;
+	try {
+		raw = await git(root, ["show", `${mb}:${path}`]);
+	} catch (err) {
+		// R22 未跟踪腿：基线里没有的路径也可能是未跟踪文件（工作区独有，git diff
+		// 与 git show 都取不到）。porcelain 确认 `??` 后改读工作树全文做预览（载荷带
+		// untracked:true，客户端头部用未跟踪专用注记）；不是未跟踪（已提交的新文件等）
+		// → 按原错误照旧落 {ok:false}，R18 行为不变。porcelain 一次查询只在 show
+		// 失败的腿上发生 —— 常规 /blob 调用零额外开销。
+		const statusText = await git(root, ["status", "--porcelain=v1", "--untracked-files=all"]);
+		const untracked = parseStatusFiles(statusText).some((f) => f.path === path && f.x === "?" && f.y === "?");
+		if (!untracked) throw err;
+		raw = await readWorkingFileCapped(root, path);
+		// 二进制与 R18 腿同一语义：不合成行（binary:true + hunks:[]，只留文件级评论）。
+		const binary = looksBinary(raw);
+		const { hunks, truncated } = binary ? { hunks: [], truncated: false } : previewHunks(raw);
+		return {
+			ok: true,
+			path,
+			base,
+			head: { sha: headSha },
+			preview: true,
+			untracked: true,
+			binary,
+			truncated,
+			hunks,
+		};
+	}
 	if (looksBinary(raw)) {
 		// 二进制（NUL 探测）→ 与变更二进制同语义：不渲染行，只留文件级评论。
 		return { ok: true, path, base, head: { sha: headSha }, preview: true, binary: true, truncated: false, hunks: [] };
 	}
 	const { hunks, truncated } = previewHunks(raw);
 	return { ok: true, path, base, head: { sha: headSha }, preview: true, binary: false, truncated, hunks };
+}
+
+/**
+ * R23 side=new：变更文件「新侧」全文。与 /diff 的行号口径无关（渲染视图不评论
+ * 行），只求内容正确：未跟踪/有工作树改动 → 工作树文件；工作树无该路径的条目
+ * （改动已提交或文件未变）→ HEAD 版本；工作树已删（y=D）→ 结构化报错 —— 客户
+ * 端把错误落成渲染态的错误框，不打回 diff 错误态。载荷复用 preview 形状，附
+ * side:"new" 供客户端区分缓存键；未跟踪来源附 untracked:true（同 R22 语义）。
+ */
+async function blobPayloadNewSide(root, path, base, headSha) {
+	const statusText = await git(root, ["status", "--porcelain=v1", "--untracked-files=all"]);
+	const entries = parseStatusFiles(statusText).filter((f) => f.path === path);
+	let raw;
+	let fromUntracked = false;
+	if (entries.some((f) => f.x === "?" && f.y === "?")) {
+		raw = await readWorkingFileCapped(root, path);
+		fromUntracked = true;
+	} else if (entries.length > 0 && entries.every((f) => f.y === "D")) {
+		throw new Error(`deleted from the working tree — no new-side content to preview: ${path}`);
+	} else if (entries.length > 0) {
+		raw = await readWorkingFileCapped(root, path);
+	} else {
+		// 工作树无此路径的改动：变更已提交（或文件未变）→ 新侧 = HEAD 内容。路径
+		// 在 HEAD 也没有（异物路径）→ git show 报错照旧落 {ok:false}。
+		raw = await git(root, ["show", `${headSha}:${path}`]);
+	}
+	const binary = looksBinary(raw);
+	const { hunks, truncated } = binary ? { hunks: [], truncated: false } : previewHunks(raw);
+	return {
+		ok: true,
+		path,
+		base,
+		head: { sha: headSha },
+		preview: true,
+		side: "new",
+		...(fromUntracked ? { untracked: true } : {}),
+		binary,
+		truncated,
+		hunks,
+	};
 }
 
 export default {
@@ -540,7 +640,7 @@ export default {
 		}));
 
 		route("GET", "/blob", withRepo(async (root, req, res) => {
-			res.json(await blobPayload(host, root, req?.query?.base, req?.query?.path));
+			res.json(await blobPayload(host, root, req?.query?.base, req?.query?.path, req?.query?.side));
 		}));
 
 		route("GET", "/resolve", withRepo(async (root, req, res) => {

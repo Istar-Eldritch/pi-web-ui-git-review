@@ -67,11 +67,29 @@
  * 评论标记全部不受影响）。默认开，头部按钮可关（关 = 纯文本节点，旧行为）。
  * One Dark 色板（.gr-tok-*），未命中令牌留默认前景色。
  *
+ * R22 未跟踪预览：/diff 的 untracked:true 零 hunk 不再是死路 —— 同一条 /blob
+ * 链也适用（服务端对 porcelain 确认的未跟踪路径改读工作树全文，载荷带
+ * untracked:true）。/blob 腿失败（旧服务端 / 文件已消失）→ 保留原「还没有
+ * diff」空态，行为可回退。展示归类里 preview 优先于 untracked（未跟踪预览载荷
+ * 同时带两个标记，必须按 preview 渲染出行），头部注记用未跟踪专用文案 —— 预览
+ * 的是工作区内容，不是基线内容，文案不能照抄 R18 的「未变更文件」。
+ *
+ * R23 Markdown 渲染视图：.md 文件的头部「渲染」开关 —— 开 = 把全文交
+ * client/markdown.mjs（零依赖节点树渲染器，安全模型见该文件头）转 DOM，替行
+ * 网格；行选中/行级评论是行网格语义，渲染态不适用（文件级评论照常可用）→
+ * 切进渲染态顺手清选中。全文来源分两态：预览态（R18/R22）载荷里就有全文，零
+ * 请求；行态（变更文件）只有 hunk 片段 → 懒取 GET /blob?side=new（服务端读
+ * 工作树/HEAD 的新侧全文），按 (base,"new") 记忆化，/diff 重拉成功即作废重取，
+ * 取数有加载/错误态（错误不打回 diff 错误态，开关切回原文即恢复）。开关只在
+ * markdown 且非二进制且真有内容时出现（已删文件的新侧是空，不渲染空）；会话
+ * 级开关（同 R21 syntaxOn），跨文件保留但每帧重验条件。
+ *
  * 纯逻辑（折叠空隙计算、行模型、状态归类）导出为独立函数，node --test 用极小
  * 假 DOM + 桩 fetch 驱动整个视图（见 test/viewer.test.mjs；fixture 补丁文本
  * 一律经 Phase 1 的 parseUnifiedDiff 取行号 —— 与 git 输出同源）。
  */
 import { MAX_CONTEXT } from "./gitcore.mjs";
+import { isMarkdownPath, markdownToTree } from "./markdown.mjs";
 import { langForPath, tokenizeLine } from "./syntax.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
 import { commentAnchorLabel } from "./store.mjs";
@@ -107,6 +125,7 @@ export function foldGapBetween(prevHunk, nextHunk) {
 /** 文件起点虚锚（行 1、0 行）：与 foldGapBetween 组合算首个 hunk 之前的空隙（R20）。 */
 const LEADING_ANCHOR = { oldStart: 1, oldLines: 0, newStart: 1, newLines: 0 };
 let syntaxOn = true; // R21 语法高亮开关（模块级会话态，不持久化；头部按钮切换）
+let renderOn = false; // R23 Markdown 渲染开关（同上；只在预览态的 md 文件上生效）
 
 /**
  * 结构化 /diff 载荷 → 渲染行模型（无 DOM）。序列：
@@ -152,9 +171,11 @@ export function buildDiffRows(payload) {
 /**
  * /diff（或 /blob）载荷 → 展示归类（R8 特例各态可辨，零 hunk 的病因分开）：
  *   mode: "rows"（正常渲染行）| "binary"（二进制注记 + 无行）
- *       | "untracked"（untracked:true 零 hunk）| "out-of-range"（范围内没该文件）
  *       | "preview"（R18 未变更文件全文预览：/blob 的 preview:true；行模型与
- *         rows 同构 —— 全 ctx 单 hunk，行号基线/HEAD 两侧一致，评论照常锚定）
+ *         rows 同构 —— 全 ctx 单 hunk，行号基线/HEAD 两侧一致，评论照常锚定；
+ *         R22 起未跟踪预览载荷同时带 untracked:true —— preview 优先，否则无内容态）
+ *       | "untracked"（untracked:true 零 hunk 且非预览 = /blob 腿失败后的空态）
+ *       | "out-of-range"（范围内没该文件）
  *   newFile/deleted/renamed/truncated: 头部注记开关。
  */
 export function describeViewerState(payload) {
@@ -164,10 +185,10 @@ export function describeViewerState(payload) {
 	return {
 		mode: payload.binary
 			? "binary"
-			: payload.untracked
-				? "untracked"
-				: payload.preview === true
-					? "preview"
+			: payload.preview === true
+				? "preview"
+				: payload.untracked
+					? "untracked"
 					: hunks.length === 0
 						? "out-of-range"
 						: "rows",
@@ -176,6 +197,16 @@ export function describeViewerState(payload) {
 		renamed,
 		truncated: payload.truncated === true,
 	};
+}
+
+/**
+ * 二进制态的注记文案键（R22）：变更二进制用通用文案；预览二进制细分 —— 未跟踪
+ * （工作区独有，谈不上「未变更」）与未变更各说各话。renderBody 的状态框与
+ * renderNotes 的头部注记共用，两处措辞永不分歧。
+ */
+export function binaryNoteKey(payload) {
+	if (payload?.preview !== true) return "viewer.kind.binary";
+	return payload.untracked === true ? "viewer.kind.binaryUntracked" : "viewer.kind.binaryPreview";
 }
 
 /** hunk 头展示文本（parser 已把「省略计数 = 1」规范化，照声明渲染）。 */
@@ -246,6 +277,36 @@ export const VIEWER_CSS = `
 .gr-tok-attr { color: #d19a66; }
 .gr-tok-key { color: #e06c75; }
 .gr-tok-at { color: #c678dd; }
+/* R23 Markdown 渲染视图（替行网格；无行选中/行评论 —— 文件级评论在头部） */
+.gr-vmd {
+	padding: 10px 14px 16px; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+	font-size: 13px; line-height: 1.6; min-height: 0;
+}
+.gr-vmd :is(h1, h2, h3, h4, h5, h6) { margin: 14px 0 6px; line-height: 1.3; }
+.gr-vmd h1 { font-size: 1.5em; }
+.gr-vmd h2 { font-size: 1.3em; }
+.gr-vmd h3 { font-size: 1.15em; }
+.gr-vmd :is(h4, h5, h6) { font-size: 1em; }
+.gr-vmd p { margin: 6px 0; }
+.gr-vmd ul, .gr-vmd ol { margin: 6px 0; padding-left: 22px; }
+.gr-vmd li { margin: 2px 0; }
+.gr-vmd pre {
+	background: var(--gr-hover); border: 1px solid var(--gr-border); border-radius: 6px;
+	padding: 8px 10px; overflow: auto; margin: 8px 0;
+}
+.gr-vmd pre code { display: block; background: none; padding: 0; white-space: pre; }
+.gr-vmd code {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
+	background: var(--gr-hover); border-radius: 4px; padding: 1px 4px;
+}
+.gr-vmd blockquote { margin: 8px 0; padding: 2px 12px; border-left: 3px solid var(--gr-border); color: var(--gr-dim); }
+.gr-vmd table { border-collapse: collapse; margin: 8px 0; }
+.gr-vmd :is(th, td) { border: 1px solid var(--gr-border); padding: 4px 10px; }
+.gr-vmd th { background: var(--gr-hover); }
+.gr-vmd a { color: var(--gr-accent); }
+.gr-vmd img { max-width: 100%; }
+.gr-vmd hr { border: none; border-top: 1px solid var(--gr-border); margin: 12px 0; }
+.gr-vmd .gr-md-task { color: var(--gr-dim); margin-right: 4px; }
 .gr-vst {
 	flex: none; font-family: ui-monospace, Menlo, Consolas, monospace; font-weight: 700; font-size: 11px;
 	min-width: 13px; text-align: center;
@@ -382,6 +443,12 @@ export function createViewer(opts = {}) {
 	let editorMode = "add"; // "add" | "edit"（列表编辑按钮 → edit，标题切换）
 	let pathComments = []; // 当前路径的草稿快照（渲染序 = 提交序）
 	const tailTotals = new Map(); // R20 尾部折叠的基线总行数缓存（key = base\u0000旧侧路径）
+	// R23：行态 md 的渲染载荷缓存（key = base\u0000"new"；载荷 = /blob?side=new 的
+	// 全文预览形状）。行态的 /diff 只有 hunk 片段，渲染用的全文按需懒取 + 记忆化
+	// —— 切回原文再切回来零请求；/diff 重拉成功后缓存作废重取（内容可能已变）。
+	const mdCache = new Map();
+	let mdLoadingKey = null; // 正在取的缓存键（渲染加载态）
+	let mdError = null; // 最近一次取全文的失败信息（渲染错误态；重拉成功即清）
 
 	// 挂载时刻的选中（store 已有选中 → 立即拉数；无 → R7 空态）。
 	const initial = store.getState();
@@ -441,14 +508,17 @@ export function createViewer(opts = {}) {
 			if (my !== seq) return;
 			if (data?.ok) {
 				payload = data;
-				// R18 未变更预览链：范围外已跟踪文件（零 hunk、非 untracked/二进制）→
-				// 再取 /blob 换全文预览。blob 腿失败（路径不在基线/网络）→ 保留 /diff
-				// 的范围外空态 —— 独立 try 包住，绝不把好端端的 /diff 结果打回错误态。
-				// 零 hunk 但路径必然不在基线的状态不白打：A（新增）、R/C（rename/copy
-				// 新路径不在基线）。M/T（零 hunk = 仅模式变化）与 D（删除的空文件在基线
-				// 存在）都能取到内容 —— D 成功时预览空文件态，比「范围外」提示更如实。
+				// R18/R22 预览链：零 hunk 的可解释空态 → 再取 /blob 换全文预览。
+				// 范围外已跟踪文件预览基线内容（R18）；未跟踪文件（untracked:true）
+				// 预览工作区内容（R22 —— 服务端在 git show 失败腿上确认 porcelain
+				// `??` 后读工作树）。blob 腿失败（路径不在基线/旧服务端没有未跟踪腿/
+				// 网络）→ 保留 /diff 的空态 —— 独立 try 包住，绝不把好端端的 /diff
+				// 结果打回错误态。零 hunk 但路径必然不在基线的已跟踪状态不白打：
+				// A（新增）、R/C（rename/copy 新路径不在基线）。M/T（零 hunk = 仅模式
+				// 变化）与 D（删除的空文件在基线存在）都能取到内容 —— D 成功时预览
+				// 空文件态，比「范围外」提示更如实。
 				const chainable = !data.status || data.status === "M" || data.status === "T" || data.status === "D";
-				if (chainable && Array.isArray(data.hunks) && data.hunks.length === 0 && data.untracked !== true && data.binary !== true) {
+				if (chainable && Array.isArray(data.hunks) && data.hunks.length === 0 && data.binary !== true) {
 					try {
 						const blobRes = await doFetch(apiUrl("/blob", { path, base }), { credentials: "same-origin" });
 						const blobText = await blobRes.text();
@@ -472,6 +542,12 @@ export function createViewer(opts = {}) {
 				payload = null;
 				errorText = data?.error ?? "unknown error";
 			}
+			// R23：行态 md 且渲染开关开着 → 懒取/重取新侧全文（预览态全文已在载荷
+			// 里，零请求；缓存命中零请求）。重拉成功即作废旧缓存 —— 内容可能已变，
+			// 渲染视图必须跟着工作区走。开关关着 → 零开销。
+			mdCache.delete(`${base ?? ""}\u0000new`);
+			mdError = null;
+			if (renderOn && canRenderMarkdown() && describeViewerState(payload).mode === "rows") void ensureRenderPayload();
 			// R20 尾部折叠的基线总行数：正常行模式（有 hunk、非二进制/未跟踪/预览）才
 			// 需要；A/D 整文件都在 hunk 里（无尾部空隙）不白打，rename/copy 用旧路径取
 			// 基线全文。失败/超限/二进制 → 不附 baseTotal（不画尾折叠，不拦展示）。
@@ -553,6 +629,80 @@ export function createViewer(opts = {}) {
 		if (destroyed) return;
 		syntaxOn = !syntaxOn;
 		render();
+	}
+
+	/** R23 头部「渲染」开关：翻转 + 全量重渲染。渲染态没有行网格（选中/行级
+	 *  评论的锚都不在屏幕上），切进来时顺手清选中 —— 行内编辑器由选中监听器收起，
+	 *  文件级编辑器（editorFromSelection=false）不受影响、照常可用。 */
+	function toggleRender() {
+		if (destroyed) return;
+		renderOn = !renderOn;
+		if (renderOn) resetSelection();
+		render();
+	}
+
+	/** 当前载荷是否处于「可渲染 Markdown」形态：markdown 扩展名 + 非二进制 +
+	 *  两种内容在手/可取的形态 —— 预览态（R18/R22，全文就在载荷里，要求真有行）
+	 *  与行态（变更文件：/diff 只有 hunk 片段，渲染用的「新侧」全文经
+	 *  /blob?side=new 懒取；已删文件的新侧是空，不渲染空 → 不给开关）。 */
+	function canRenderMarkdown() {
+		if (!payload || payload.binary === true) return false;
+		if (!isMarkdownPath(payload.path ?? "")) return false;
+		const mode = describeViewerState(payload).mode;
+		const hunks = Array.isArray(payload.hunks) ? payload.hunks : [];
+		if (mode === "preview") return hunks.some((h) => Array.isArray(h.lines) && h.lines.length > 0);
+		if (mode === "rows") return hunks.length > 0 && payload.status !== "D";
+		return false;
+	}
+
+	/** R23 头部「渲染」开关：翻转 + 全量重渲染。渲染态没有行网格（选中/行级
+	 *  评论的锚都不在屏幕上），切进来时顺手清选中 —— 行内编辑器由选中监听器收起，
+	 *  文件级编辑器（editorFromSelection=false）不受影响、照常可用。行态（变更
+	 *  文件）的全文不在手里 → 切进来时懒取 /blob?side=new（加载/错误态见
+	 *  renderBody；预览态全文已在载荷里，零请求）。 */
+	function toggleRender() {
+		if (destroyed) return;
+		renderOn = !renderOn;
+		if (renderOn) {
+			resetSelection();
+			if (payload && describeViewerState(payload).mode === "rows" && canRenderMarkdown()) void ensureRenderPayload();
+		}
+		render();
+	}
+
+	/** R23：行态渲染用的新侧全文懒取（/blob?side=new）。记忆化按 (base,"new")
+	 *  —— /diff 重拉成功后由 refresh 清缓存重取（内容可能已变）。失败不缓存
+	 *  （mdError 落错误态，refresh 可重试）；不在飞行中重复发起。 */
+	async function ensureRenderPayload() {
+		if (destroyed || !mountedPath) return;
+		const key = `${mountedBase ?? ""}\u0000new`;
+		if (mdCache.has(key) || mdLoadingKey === key) return;
+		mdLoadingKey = key;
+		mdError = null;
+		render(); // 加载态先落屏
+		try {
+			const res = await doFetch(apiUrl("/blob", { path: mountedPath, base: mountedBase, side: "new" }), { credentials: "same-origin" });
+			const text = await res.text();
+			let data;
+			try {
+				data = text ? JSON.parse(text) : {};
+			} catch {
+				throw new Error(`bad response (${res.status})`);
+			}
+			if (destroyed) return;
+			if (data?.ok) {
+				mdCache.set(key, data);
+			} else {
+				mdError = data?.error ?? "unknown error";
+			}
+		} catch (err) {
+			if (!destroyed) mdError = err instanceof Error ? err.message : String(err);
+		} finally {
+			if (!destroyed) {
+				if (mdLoadingKey === key) mdLoadingKey = null;
+				render();
+			}
+		}
 	}
 
 	/* ---- 行命中模型（Phase 4 消费；本阶段只做选中） ---- */
@@ -713,6 +863,15 @@ export function createViewer(opts = {}) {
 					title: t("viewer.syntaxHint"),
 					onclick: () => toggleSyntax(),
 				})),
+				// R23 Markdown 渲染开关（会话级；只在全文预览态的 md 文件上出现）。
+				canRenderMarkdown()
+					? (model.els.renderBtn = el("button", {
+							class: `gr-vbtn gr-vrender${renderOn ? " on" : ""}`,
+							text: t("viewer.render"),
+							title: t("viewer.renderHint"),
+							onclick: () => toggleRender(),
+						}))
+					: (model.els.renderBtn = undefined),
 				// R17：内嵌面板的还原入口（opts.onClose 注入才有）—— 点击由 inline 控制器
 				// 还原消息面板；全屏形态不传 onClose，头部与 Phase 4 完全一致。
 				typeof opts.onClose === "function"
@@ -744,14 +903,26 @@ export function createViewer(opts = {}) {
 		if (d.newFile) notes.push(el("div", { class: "gr-vnote", text: t("viewer.kind.newFile") }));
 		if (d.deleted) notes.push(el("div", { class: "gr-vnote", text: t("viewer.kind.deleted") }));
 		if (d.mode === "preview") {
-			// R18：范围外未变更（无 status）→「未变更文件」注记；范围内零 hunk（如仅
-			// 权限/模式变化，status 存在）→ 如实区分，别把已列入评审范围的文件说成未变更。
-			const key = payload.status ? "viewer.kind.previewInRange" : "viewer.kind.preview";
+			// R22：未跟踪预览读的是工作区内容（没有「基线」可言）→ 专用注记，不能照抄
+			// R18 的「预览基线内容」。其余预览态按有无 status 区分「未变更文件」与
+			// 「范围内未变更（如仅权限/模式变化）」—— 如实区分，别把已列入评审范围的
+			// 文件说成未变更。
+			const key = payload.untracked === true
+				? "viewer.kind.untrackedPreview"
+				: payload.status
+					? "viewer.kind.previewInRange"
+					: "viewer.kind.preview";
 			notes.push(el("div", { class: "gr-vnote gr-vnote-preview", text: t(key) }));
 		}
+		// R23：渲染态把行网格换掉了（预览态与行态同理）—— 行级评论/选中不可用，
+		// 如实告知（文件级评论不受影响，头部按钮照常可用）。
+		if (renderOn && canRenderMarkdown()) {
+			notes.push(el("div", { class: "gr-vnote gr-vnote-preview", text: t("viewer.renderNote") }));
+		}
 		if (d.mode === "binary") {
-			// R18：预览态的二进制没有「变更」可言 —— 注记用预览措辞。
-			notes.push(el("div", { class: "gr-vnote", text: t(payload.preview ? "viewer.kind.binaryPreview" : "viewer.kind.binary") }));
+			// R18：预览态的二进制没有「变更」可言；R22：未跟踪二进制连「未变更」都
+			// 谈不上 —— binaryNoteKey 三种措辞各归其位（与状态框同一键，永不分歧）。
+			notes.push(el("div", { class: "gr-vnote", text: t(binaryNoteKey(payload)) }));
 			notes.push(el("div", { class: "gr-vnote", text: t("viewer.kind.binaryHint") }));
 		}
 		return notes;
@@ -806,7 +977,7 @@ export function createViewer(opts = {}) {
 			);
 		}
 		if (d.mode === "binary") {
-			body.append(stateBox(t(payload?.preview ? "viewer.kind.binaryPreview" : "viewer.kind.binary"), t("viewer.kind.binaryHint")));
+			body.append(stateBox(t(binaryNoteKey(payload)), t("viewer.kind.binaryHint")));
 			return body;
 		}
 		if (d.mode === "untracked") {
@@ -825,11 +996,58 @@ export function createViewer(opts = {}) {
 				body.append(stateBox(t("viewer.state.emptyFile"), t("viewer.state.emptyFileHint")));
 				return body;
 			}
+			// R23：md 文件的渲染视图（开关开且条件成立）替行网格 —— 同一份全文，
+			// 只是呈现方式不同；截断横幅在外层已画，渲染的是截断后的文本（如实）。
+			if (renderOn && canRenderMarkdown()) {
+				body.append(renderMarkdownView(payload));
+				return body;
+			}
 			body.append(renderDiffRows({ headers: false }));
+			return body;
+		}
+		// R23：行态（变更文件）的渲染视图 —— 全文不在 /diff 载荷里，走 mdCache
+		//（/blob?side=new 懒取）：命中 → 渲染；在取 → 加载态；失败 → 错误态（错误
+		// 不打回 diff 错误态 —— 头部开关还在，切回原文即恢复完整行评审）。
+		if (renderOn && canRenderMarkdown()) {
+			const key = `${mountedBase ?? ""}\u0000new`;
+			if (mdCache.has(key)) {
+				body.append(renderMarkdownView(mdCache.get(key)));
+				return body;
+			}
+			if (mdLoadingKey === key) {
+				body.append(stateBox(t("viewer.renderLoading"), null));
+				return body;
+			}
+			body.append(stateBox(t("viewer.renderError", { e: mdError ?? "?" }), null));
 			return body;
 		}
 		body.append(renderDiffRows());
 		return body;
+	}
+
+	/** R23：渲染用全文（预览态 = 载荷本身的全 ctx 单 hunk；行态 = /blob?side=new
+	 *  缓存载荷）。行序即文件序；截断时是截断后的文本。行文本就是原始内容（无
+	 *  diff 标记前缀，previewHunks 同源），直接拼接。 */
+	function previewMarkdownText(data) {
+		const hunks = Array.isArray(data?.hunks) ? data.hunks : [];
+		return hunks
+			.flatMap((h) => (Array.isArray(h.lines) ? h.lines : []))
+			.map((l) => l.text ?? "")
+			.join("\n");
+	}
+
+	/** R23：Markdown 渲染视图容器 —— markdown.mjs 的节点树经 makeEl 落地。
+	 *  安全性由节点树形态保证：没有 innerHTML，一切文本走 textContent（见该模块
+	 *  头注释）；渲染失败不该拖垮查看器 —— 包 try，崩了回落到原文行网格（预览
+	 *  态）或保持空（行态的 data 不含行网格语义 —— 用载荷兜底渲染，通常不触发）。 */
+	function renderMarkdownView(data) {
+		const box = el("div", { class: "gr-vmd" });
+		try {
+			for (const node of markdownToTree(previewMarkdownText(data))) box.append(mdNodeToEl(node, el));
+		} catch {
+			return renderDiffRows({ headers: false });
+		}
+		return box;
 	}
 
 	function renderDiffRows({ headers = true } = {}) {
@@ -1133,6 +1351,15 @@ function apiBaseDefault() {
 		/* fall through */
 	}
 	return "/plugins-api/git-review";
+}
+
+/**
+ * R23：markdown.mjs 的中间节点树 → DOM（递归；字符串子节点经 makeEl 的 append
+ * 落成文本节点 —— 全程无 innerHTML，安全模型见 markdown.mjs 头注释）。
+ */
+function mdNodeToEl(node, el) {
+	const kids = (node.children ?? []).map((c) => (typeof c === "string" ? c : mdNodeToEl(c, el)));
+	return el(node.tag, node.attrs ?? {}, kids);
 }
 
 /** 极简 DOM 构建器（navigator/image-toolkit util el 同款；document 可注入便于测试）。 */

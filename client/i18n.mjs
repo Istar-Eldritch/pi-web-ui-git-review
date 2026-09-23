@@ -90,10 +90,23 @@ export const DICT = {
 		// Phase 5（R18）：全树未变更文件的预览态（/blob 全文，行级评论照常可用）。
 		"viewer.kind.preview": "未变更文件：预览基线内容，可对任意行或整个文件留评论。",
 		"viewer.kind.previewInRange": "文件内容未变更（可能是权限/模式改动）：预览全文，可评论。",
+		// R22：未跟踪文件的预览态（/blob 未跟踪腿读工作树全文）—— 预览的不是基线，
+		// 不能照抄 R18 的「未变更文件」措辞。
+		"viewer.kind.untrackedPreview": "未跟踪文件：预览工作区内容，可对任意行或整个文件留评论。",
+		"viewer.kind.binaryUntracked": "未跟踪的二进制文件（不展示内容）",
+		// R23：Markdown 渲染视图开关（只在全文预览态的 md 文件上出现）。渲染态没有
+		// 行网格 —— 行选中/行级评论不可用，注记里如实说明。
+		"viewer.render": "渲染",
+		"viewer.renderHint": "以渲染后的视图查看此 Markdown 文件（只读）；行级评论请切回原文。",
+		"viewer.renderNote": "Markdown 渲染视图（只读）：行级评论与行选中在原文视图可用，文件级评论照常。",
+		// R23：行态（变更文件）的全文懒取三态。
+		"viewer.renderLoading": "正在载入文件全文（渲染视图用）……",
+		"viewer.renderError": "渲染视图取不到文件全文：{e}。可切回原文视图继续评审。",
 		"nav.select.preview": "预览全文并留评论：{path}",
 		"viewer.kind.previewTruncated": "预览已截断：文件超过单文件预览上限，仅显示前半部分。",
 		"viewer.state.emptyFile": "空文件（0 行）",
-		"viewer.state.emptyFileHint": "文件在基线中存在但没有内容。",
+		// R22：空文件态也覆盖未跟踪的空文件（它不在基线里）—— 措辞保持中性。
+		"viewer.state.emptyFileHint": "文件存在但没有内容。",
 		"viewer.state.untracked": "未跟踪文件还没有 diff",
 		"viewer.state.untrackedHint": "该文件尚未被 git 跟踪；加入暂存或提交后，这里会显示它的 diff。",
 		"viewer.state.outOfRange": "相对评审基线没有该文件的变更",
@@ -201,10 +214,21 @@ export const DICT = {
 		// Phase 5 (R18): preview mode for unchanged files in the full tree (/blob full text, line comments welcome).
 		"viewer.kind.preview": "Unchanged file: previewing the base content — line and file comments are welcome.",
 		"viewer.kind.previewInRange": "File content unchanged (possibly a mode change): previewing the full text — comments are welcome.",
+		// R22: untracked preview leg (/blob reads the working-tree file) — not base content, so not the R18 wording.
+		"viewer.kind.untrackedPreview": "Untracked file: previewing the working-tree content — line and file comments are welcome.",
+		"viewer.kind.binaryUntracked": "Untracked binary file (content not shown)",
+		// R23: rendered Markdown toggle (preview-mode .md files only). The rendered view has no line grid — line comments/selection live in the raw view.
+		"viewer.render": "Rendered",
+		"viewer.renderHint": "View this Markdown file rendered (read-only); switch back to the raw text for line comments.",
+		"viewer.renderNote": "Rendered Markdown view (read-only): line selection and line comments live in the raw view; file comments stay available.",
+		// R23: lazy new-side fetch states (changed files).
+		"viewer.renderLoading": "Loading the file contents (for the rendered view)…",
+		"viewer.renderError": "Cannot load the file contents for the rendered view: {e}. Switch back to the raw view to keep reviewing.",
 		"nav.select.preview": "Preview the full text to comment: {path}",
 		"viewer.kind.previewTruncated": "Preview truncated: the file exceeds the per-file preview cap (only the first part is shown).",
 		"viewer.state.emptyFile": "Empty file (0 lines)",
-		"viewer.state.emptyFileHint": "The file exists at the base but has no content.",
+		// R22: the empty state also covers untracked empty files (which are not at the base) — keep the wording neutral.
+		"viewer.state.emptyFileHint": "The file exists but has no content.",
 		"viewer.state.untracked": "Untracked file — no diff yet",
 		"viewer.state.untrackedHint": "The file is not tracked by git yet; stage or commit it to see a diff here.",
 		"viewer.state.outOfRange": "No changes to this file relative to the review base",

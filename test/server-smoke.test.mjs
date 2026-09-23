@@ -691,6 +691,145 @@ describe("GET /blob (R18 unchanged-file preview)", () => {
 	});
 });
 
+describe("GET /blob untracked leg (R22 working-tree preview)", () => {
+	it("untracked file → preview of the working-tree content, untracked:true", async () => {
+		const { root, g } = makeScratchRepo("git-review-blob-unt-");
+		try {
+			g(["commit", "-q", "--allow-empty", "-m", "base"]);
+			writeFileSync(join(root, "new-thing.txt"), "alpha\nbeta\n");
+			const host = freshHost({ cwd: root });
+			const out = await callRoute(host, "GET", "/blob", { query: { path: "new-thing.txt", base: "main" } });
+			assert.equal(out.ok, true);
+			assert.equal(out.preview, true);
+			assert.equal(out.untracked, true, "the untracked flag rides along for the viewer's note");
+			assert.equal(out.binary, false);
+			assert.equal(out.truncated, false);
+			assert.equal(out.hunks.length, 1);
+			assert.deepEqual(
+				out.hunks[0].lines.map((l) => [l.type, l.old, l.new, l.text]),
+				[["ctx", 1, 1, "alpha"], ["ctx", 2, 2, "beta"]],
+				"same all-context shape as the R18 leg",
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("untracked binary file → binary:true, no lines (file-level comment only)", async () => {
+		const { root, g } = makeScratchRepo("git-review-blob-untbin-");
+		try {
+			g(["commit", "-q", "--allow-empty", "-m", "base"]);
+			writeFileSync(join(root, "new.bin"), Buffer.from([0x00, 0x01, 0x02]));
+			const host = freshHost({ cwd: root });
+			const out = await callRoute(host, "GET", "/blob", { query: { path: "new.bin", base: "main" } });
+			assert.equal(out.ok, true);
+			assert.equal(out.preview, true);
+			assert.equal(out.untracked, true);
+			assert.equal(out.binary, true);
+			assert.deepEqual(out.hunks, []);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("tracked-but-missing-at-base still fails structured (the untracked leg does not swallow it)", async () => {
+		const { root, g } = makeScratchRepo("git-review-blob-untmiss-");
+		try {
+			g(["commit", "-q", "--allow-empty", "-m", "base"]);
+			// 基线钉在首笔提交（main 会随第二笔提交前进 —— 与 MAX_FILES 测试同一口径）
+			const baseSha = g(["rev-parse", "HEAD"]).trim();
+			writeFileSync(join(root, "committed-later.txt"), "later\n");
+			g(["add", "committed-later.txt"]);
+			g(["commit", "-q", "-m", "later"]);
+			const host = freshHost({ cwd: root });
+			const out = await callRoute(host, "GET", "/blob", { query: { path: "committed-later.txt", base: baseSha } });
+			assert.equal(out.ok, false, "tracked file missing at the base is not untracked → original error stands");
+			assert.ok(!out.untracked);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("GET /blob side=new (R23: new-side full text for changed files)", () => {
+	it("worktree-modified file → working-tree content; side omitted → base content (old contract intact)", async () => {
+		const { root, g } = makeScratchRepo("git-review-blob-new-");
+		try {
+			g(["commit", "-q", "--allow-empty", "-m", "base"]);
+			writeFileSync(join(root, "doc.md"), "# base\n");
+			g(["add", "doc.md"]);
+			g(["commit", "-q", "-m", "add doc"]);
+			const baseSha = g(["rev-parse", "HEAD"]).trim();
+			writeFileSync(join(root, "doc.md"), "# worktree\n");
+			const host = freshHost({ cwd: root });
+			const isNew = await callRoute(host, "GET", "/blob", { query: { path: "doc.md", base: baseSha, side: "new" } });
+			assert.equal(isNew.ok, true);
+			assert.equal(isNew.side, "new");
+			assert.equal(isNew.hunks[0].lines.map((l) => l.text).join("\n"), "# worktree\n".replace(/\n$/, ""));
+			const isOld = await callRoute(host, "GET", "/blob", { query: { path: "doc.md", base: baseSha } });
+			assert.equal(isOld.ok, true);
+			assert.equal(isOld.hunks[0].lines.map((l) => l.text).join("\n"), "# base");
+			assert.ok(!("side" in isOld), "old-side payload carries no side marker");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("committed-only change with a clean worktree → HEAD content", async () => {
+		const { root, g } = makeScratchRepo("git-review-blob-newhead-");
+		try {
+			g(["commit", "-q", "--allow-empty", "-m", "base"]);
+			writeFileSync(join(root, "doc.md"), "# base\n");
+			g(["add", "doc.md"]);
+			g(["commit", "-q", "-m", "add doc"]);
+			const baseSha = g(["rev-parse", "HEAD"]).trim();
+			writeFileSync(join(root, "doc.md"), "# committed\n");
+			g(["add", "doc.md"]);
+			g(["commit", "-q", "-m", "edit doc"]); // 工作树干净，变更已提交
+			const host = freshHost({ cwd: root });
+			const out = await callRoute(host, "GET", "/blob", { query: { path: "doc.md", base: baseSha, side: "new" } });
+			assert.equal(out.ok, true);
+			assert.equal(out.hunks[0].lines.map((l) => l.text).join("\n"), "# committed");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("worktree-deleted file → structured error mentioning the deletion", async () => {
+		const { root, g } = makeScratchRepo("git-review-blob-newdel-");
+		try {
+			g(["commit", "-q", "--allow-empty", "-m", "base"]);
+			writeFileSync(join(root, "doc.md"), "# base\n");
+			g(["add", "doc.md"]);
+			g(["commit", "-q", "-m", "add doc"]);
+			const baseSha = g(["rev-parse", "HEAD"]).trim();
+			rmSync(join(root, "doc.md")); // 工作树删除（未暂存）
+			const host = freshHost({ cwd: root });
+			const out = await callRoute(host, "GET", "/blob", { query: { path: "doc.md", base: baseSha, side: "new" } });
+			assert.equal(out.ok, false);
+			assert.match(out.error, /deleted from the working tree/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("untracked file via side=new → working-tree content with untracked:true", async () => {
+		const { root, g } = makeScratchRepo("git-review-blob-newunt-");
+		try {
+			g(["commit", "-q", "--allow-empty", "-m", "base"]);
+			writeFileSync(join(root, "fresh.md"), "# fresh\n");
+			const host = freshHost({ cwd: root });
+			const out = await callRoute(host, "GET", "/blob", { query: { path: "fresh.md", base: "main", side: "new" } });
+			assert.equal(out.ok, true);
+			assert.equal(out.side, "new");
+			assert.equal(out.untracked, true);
+			assert.equal(out.hunks[0].lines.map((l) => l.text).join("\n"), "# fresh");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 /* ------------------------------------------------------------------ */
 /* R18 预览纯函数（实现随服务端住在 index.mjs —— 见 client/gitcore.mjs 尾注）*/
 /* ------------------------------------------------------------------ */
