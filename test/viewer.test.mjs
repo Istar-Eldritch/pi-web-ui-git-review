@@ -1441,6 +1441,78 @@ describe("unchanged-file preview (R18: /blob chain)", () => {
 		view.destroy();
 	});
 
+	it("preview rows render a single merged gutter (no duplicated line numbers)", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({ "/blob": blobRouteFor("alpha\nbeta\n") });
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		const rows = lineRowsOf(view.root);
+		assert.equal(rows.length, 2);
+		for (const row of rows) {
+			const gutters = collect(row.el, "gr-vg");
+			assert.equal(gutters.length, 1, "one gutter cell per preview row — old===new would paint the number twice");
+			assert.ok(gutters[0].classList.contains("merged"), "the gutter spans both number columns");
+			assert.equal(gutters[0].dataset.side, "new", "merged gutter anchors the new side");
+			assert.ok(gutters[0].textContent.length > 0, "the single gutter carries the line number");
+		}
+		view.destroy();
+	});
+
+	it("normal diff rows keep their empty gutter placeholders (grid columns must not shift)", async () => {
+		resetStore();
+		store.setSelection({ path: "main.txt", base: "main" });
+		const server = createStubServer({
+			"main.txt": () => ({
+				ok: true,
+				path: "main.txt",
+				base: { ref: "main", sha: SHA_BASE, source: "marker" },
+				head: { sha: SHA_HEAD },
+				status: "M",
+				binary: false,
+				truncated: false,
+				hunks: [{
+					oldStart: 1, oldLines: 3, newStart: 1, newLines: 3,
+					lines: [
+						{ type: "del", old: 1, text: "gone" },
+						{ type: "add", new: 1, text: "added" },
+						{ type: "ctx", old: 2, new: 2, text: "same" },
+					],
+				}],
+			}),
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		const byType = (type) => lineRowsOf(view.root).filter((row) => row.type === type);
+		// 五列网格靠子元素占位对齐：del/add 行的无号侧必须是空占位 span，
+		// 否则整行左移一格、内容挤进窄列被截断（回归：R18 预览合并 gutter 曾删掉占位）。
+		const delRow = byType("del")[0].el;
+		assert.equal(delRow.childNodes.length, 5);
+		assert.equal(collect(delRow, "gr-vg")[0].textContent, "1", "del row: old gutter carries the number");
+		assert.equal(collect(delRow, "gr-vg")[1].textContent, "", "del row: new gutter is an empty placeholder");
+		assert.ok(delRow.childNodes[4].classList.contains("gr-vcontent"), "content stays in the 5th column");
+		const addRow = byType("add")[0].el;
+		assert.equal(addRow.childNodes.length, 5);
+		assert.equal(collect(addRow, "gr-vg")[0].textContent, "", "add row: old gutter is an empty placeholder");
+		assert.equal(collect(addRow, "gr-vg")[1].textContent, "1", "add row: new gutter carries the number");
+		assert.ok(addRow.childNodes[4].classList.contains("gr-vcontent"), "content stays in the 5th column");
+		const ctxRow = byType("ctx")[0].el;
+		assert.equal(ctxRow.childNodes.length, 5);
+		assert.equal(collect(ctxRow, "gr-vg")[0].dataset.side, "old");
+		assert.equal(collect(ctxRow, "gr-vg")[1].dataset.side, "new");
+		view.destroy();
+	});
+
 	it("in-range zero-hunk previews (e.g. mode-only change, status M) get their own honest note", async () => {
 		resetStore();
 		store.setSelection({ path: "main.txt", base: "main" });

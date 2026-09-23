@@ -237,6 +237,7 @@ export const VIEWER_CSS = `
 }
 .gr-vg.hot { cursor: pointer; }
 .gr-vg.hot:hover { background: var(--gr-hover); }
+.gr-vg.merged { grid-column: span 2; }
 .gr-vsign { text-align: center; white-space: pre; }
 .gr-vcontent { white-space: pre; padding-right: 12px; min-width: 0; overflow: hidden; }
 .gr-vline.add { background: var(--gr-addbg); }
@@ -753,14 +754,20 @@ export function createViewer(opts = {}) {
 		const isDel = line.type === "del";
 		const oldNo = Number.isFinite(line.old) ? line.old : null;
 		const newNo = Number.isFinite(line.new) ? line.new : null;
-		const oldCell = oldNo === null
-			? el("span", { class: "gr-vg" })
-			: el("span", { class: "gr-vg hot", text: String(oldNo), dataset: { side: "old", line: String(oldNo) } });
+		// R18 预览态行号去重：预览里 old===new 恒等，双 gutter 会把同一行号画两遍
+		// → 单格跨两列（.merged，右对齐落在原 new 列位置），其余列位置不变。
+		const mergedGutter = payload?.preview === true && oldNo !== null && oldNo === newNo;
+		// 无号一侧保留空占位 span —— 网格自动布局靠它撑住列位，少一个子元素整行左移一格。
+		const oldCell = mergedGutter
+			? null
+			: oldNo === null
+				? el("span", { class: "gr-vg" })
+				: el("span", { class: "gr-vg hot", text: String(oldNo), dataset: { side: "old", line: String(oldNo) } });
 		const newCell = newNo === null
 			? el("span", { class: "gr-vg" })
-			: el("span", { class: "gr-vg hot", text: String(newNo), dataset: { side: "new", line: String(newNo) } });
+			: el("span", { class: `gr-vg hot${mergedGutter ? " merged" : ""}`, text: String(newNo), dataset: { side: "new", line: String(newNo) } });
 		// 旧行号 → old 侧、新行号 → new 侧；shift 点击无条件从锚延伸。
-		if (oldNo !== null) oldCell.addEventListener("click", (event) => onLineClick(line, "old", event));
+		if (oldCell) oldCell.addEventListener("click", (event) => onLineClick(line, "old", event));
 		if (newNo !== null) newCell.addEventListener("click", (event) => onLineClick(line, "new", event));
 		const sign = el("span", { class: "gr-vsign", text: isAdd ? "+" : isDel ? "-" : " " });
 		// R9 行标记：行号落在某条同侧草稿区间内的行带 ● + commented 底色
@@ -778,7 +785,8 @@ export function createViewer(opts = {}) {
 				type: line.type,
 			},
 		});
-		rowEl.append(oldCell, newCell, sign, mark, content);
+		if (oldCell) rowEl.append(oldCell);
+		rowEl.append(newCell, sign, mark, content);
 		model.rows.push({ el: rowEl, line, markEl: mark });
 		return rowEl;
 	}
