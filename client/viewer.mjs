@@ -45,6 +45,10 @@
  * 写入（视图模式等）经 fetch-key 比对跳过。两个 mount（navigator + viewer，R15）
  * 都活时靠这条通道联动，挂载清理严格对称。
  *
+ * Phase 5（R17）内嵌形态：createViewer 新增可选 opts.onClose —— 传入时头部
+ * 多一个「关闭」按钮（inline.mjs 的内嵌面板用：点它还原消息面板）；全屏挂载
+ * 不传，头部与 Phase 4 完全一致。
+ *
  * 纯逻辑（折叠空隙计算、行模型、状态归类）导出为独立函数，node --test 用极小
  * 假 DOM + 桩 fetch 驱动整个视图（见 test/viewer.test.mjs；fixture 补丁文本
  * 一律经 Phase 1 的 parseUnifiedDiff 取行号 —— 与 git 输出同源）。
@@ -280,6 +284,8 @@ export function ensureViewerStyles(doc) {
  *   fetchImpl  fetch 注入（缺省全局 fetch；测试用桩替换）
  *   document   DOM 文档（缺省全局 document；测试注入极小假 DOM）
  *   lang       初始语言（缺省 detectLang()；测试固定用）
+ *   onClose    可选：传入时头部渲染「关闭」按钮（R17 内嵌面板的还原入口），
+ *              点击回调；不传则不渲染（全屏形态不变）。
  *
  * 选中/基线一律走 ./store.mjs 单例（两个 mount 共享，R15）；viewer 内部订阅：
  * selectedPath / selectedBase 任一变化 → 重拉 /diff（fetch-key 比对跳过无关写入）。
@@ -555,6 +561,16 @@ export function createViewer(opts = {}) {
 						}))
 					: (model.els.fileCommentBtn = undefined),
 				(model.els.refreshBtn = el("button", { class: "gr-vbtn", text: t("nav.refresh"), onclick: () => void refresh() })),
+				// R17：内嵌面板的还原入口（opts.onClose 注入才有）—— 点击由 inline 控制器
+				// 还原消息面板；全屏形态不传 onClose，头部与 Phase 4 完全一致。
+				typeof opts.onClose === "function"
+					? (model.els.closeBtn = el("button", {
+							class: "gr-vbtn gr-vclose",
+							text: t("viewer.close"),
+							title: t("viewer.close"),
+							onclick: () => opts.onClose(),
+						}))
+					: (model.els.closeBtn = undefined),
 			]),
 			payload?.base?.ref
 				? el("div", { class: "gr-vbaserow" }, [

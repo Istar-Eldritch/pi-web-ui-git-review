@@ -18,14 +18,19 @@
  * Phase 1 的 GET /diff（结构化 hunks，R8），选中来自共享 store 单例的
  * selectedPath+selectedBase（setSelection 原子写入；viewer 内部订阅两者，任一
  * 变化重拉）。无选中 → R7 空态提示指向右栏导航。导航侧的文件点击（navigator.mjs
- * row click）写选中 + 经宿主桥 setView("plugin:git-review") 切主区。
+ * row click）写选中；展示由 entry 注入的 openFile 决定。
  * 跨 mount 共享一律走 client/store.mjs（模块级单例）。
  * Phase 4 = 导航头部加评审摘要 + 提交动作（R10/R11）：提交流在 submit.mjs，
  * submitter 由本文件在 mount 时创建注入 navigator（entry 级装配点）。
+ * Phase 5（R17）= 文件点击**内嵌优先**：inline.mjs 控制器把 viewer 装进聊天
+ * 主区的消息面板位置（.messages-wrap，输入框留在原地），不再全屏切主区；
+ * 控制器同为模块级单例（getInlineController）—— tab 切走后内嵌面板照常活着。
+ * 全屏插件视图（setView）仍是钉选/溢出菜单入口 + 锐找不到时的兑底。
  */
 import { createNavigator } from "./navigator.mjs";
 import { createViewer } from "./viewer.mjs";
 import { createReviewSubmitter } from "./submit.mjs";
+import { closeHostModalIfIn, getInlineController } from "./inline.mjs";
 import { apiBaseFromUrl } from "./store.mjs";
 
 /**
@@ -56,13 +61,23 @@ export default {
 		if (role === "navigator") {
 			// 右栏导航：消费 Phase 1 路由的真实现（数据通道见文件头注释）。
 			const apiBase = apiBaseFromUrl(import.meta.url);
+			const doc = el.ownerDocument ?? globalThis.document;
+			// R17 内嵌面板（entry 级装配点）：控制器是模块级单例 —— tab 切走（宿主
+			// 卸载非活动 tab）后内嵌 diff 照常活着；重挂载只需把新 ctx 接回 onData。
+			const inline = getInlineController({ apiBase, document: doc, ctx });
 			const nav = createNavigator({
 				apiBase,
 				ctx,
-				document: el.ownerDocument ?? globalThis.document,
+				document: doc,
 				// R11 提交装配（entry 级装配点）：submitter 在这里创建注入视图 ——
 				// 桥投递 / marker 推进 / 剪贴板兜底全在提交流（submit.mjs），视图只渲染通知。
 				submitter: createReviewSubmitter({ apiBase }),
+				// R17 内嵌优先：文件点击 → inline.open()（控制器内部自己兑底 setView）。
+				// 模态形态（右栏 tab 以弹窗打开）先关弹窗，别让内嵌面板藏在弹窗底下。
+				openFile: () => {
+					closeHostModalIfIn(nav.root);
+					inline.open();
+				},
 			});
 			el.appendChild(nav.root);
 			void nav.refresh(); // 首次装载（视图自身只渲染 loading 态，不自动发请求，便于测试确定性）

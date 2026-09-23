@@ -12,6 +12,7 @@
 	await import("./tree-route.test.mjs");
 	await import("./navigator.test.mjs");
 	await import("./viewer.test.mjs");
+	await import("./inline.test.mjs");
 	await import("./comments.test.mjs");
 })().catch((err) => {
 	console.error(err);

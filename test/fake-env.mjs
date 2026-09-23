@@ -126,6 +126,20 @@ export class FakeElement {
 		return this._attributes[name] ?? null;
 	}
 
+	removeAttribute(name) {
+		delete this._attributes[name];
+	}
+
+	/** 最近祖先匹配（只支持 inline.mjs 用到的 `.class` 形态）。 */
+	closest(selector) {
+		const cls = typeof selector === "string" && selector.startsWith(".") ? selector.slice(1) : null;
+		if (!cls) return null;
+		for (let node = this; node; node = node.parentNode) {
+			if (typeof node.classList?.contains === "function" && node.classList.contains(cls)) return node;
+		}
+		return null;
+	}
+
 	addEventListener(type, handler) {
 		let handlers = this._listeners.get(type);
 		if (!handlers) {
@@ -187,10 +201,15 @@ export function collect(node, className, into = []) {
 export function createBridgeSpy() {
 	const setViews = [];
 	const localeHandlers = new Set();
+	let closeModals = 0;
 	const host = {
 		/** 桥契约 web/src/plugin-host.ts：setView(view: string) — void 返回。 */
 		setView: (view) => {
 			setViews.push(view);
+		},
+		/** 桥契约：closeModal() 关掉当前弹窗（幂等）。 */
+		closeModal: () => {
+			closeModals += 1;
 		},
 		/** change-only 订阅：登记处理器、返回注销函数，不回放当前语言。 */
 		onLocale: (handler) => {
@@ -201,6 +220,9 @@ export function createBridgeSpy() {
 	return {
 		host,
 		setViews,
+		get closeModals() {
+			return closeModals;
+		},
 		deliverLocale(loc) {
 			for (const handler of [...localeHandlers]) handler(loc);
 		},

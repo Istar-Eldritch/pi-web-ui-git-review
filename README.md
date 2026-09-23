@@ -14,14 +14,21 @@
   **不带 `--name` 时默认用仓库名**，那会让路由基和 setView 视图 id 全部指向错误 id —— 必须带 `--name git-review`。
 
 激活后贡献两个面（R1）：右栏一个「Diff 评审」tab（导航器）+ 主区插件视图（diff 查看器，合成顶栏项默认隐藏，
-可从 ⋯ 溢出菜单 / 插件菜单钉选列表进入，或由导航器的文件点击经 `setView` 自动切入）。
+可从 ⋯ 溢出菜单 / 插件菜单钉选列表进入）。导航器的文件点击默认走**内嵌面板**（R17，见下）；
+全屏插件视图仍是钉选入口 + 内嵌锚找不到时的兑底。
 
 ## 使用
 
 1. **看变更**：右栏「Diff 评审」tab 列出相对评审基线（存储的 marker，缺省主线预选）的全部变更 —— 含已提交 +
    未提交 + 未跟踪（各有可见标记），改名显示 `old → new`，可切树形/平铺、仅变更/全树。
 2. **选基线**：头部「更改」打开基线选择器（本地/远程分支、最近提交、手动输入）；覆盖只影响本次评审，**永不移动存储的 marker**。
-3. **读 diff**：点文件 → 主区统一 diff（旧/新双行号、可展开的未变更折叠、新文件/删除/改名/二进制/截断各态）。
+3. **读 diff**：点文件 → diff 面板（旧/新双行号、可展开的未变更折叠、新文件/删除/改名/二进制/截断各态）。
+   展示形态（R17，内嵌优先）：diff **替换聊天主区的消息列表面板**（`main.main > .messages-wrap` 的内容），
+   聊天头部与输入框留在原地 —— 评审时随时能打字；头部「关闭」还原消息面板（选中保留，再点同一文件 =
+   原地重开并重拉）。找不到消息面板（宿主结构变了）→ 自动回落旧的 `setView` 全屏切换；全屏插件视图正
+   正在展示时点击文件照常内嵌（聊天 pane 切回来，全屏 pane 转隐藏但可从钉选再进）。当前在终端/Git 视图时
+   点击文件 → 同样落座到聊天面板并 `setView("chat")` 切回去；工作区切换广播（cwd-changed）会清选中并自动
+   收起还原。
 4. **写评论**（R9）：
    - 点行（或点第一行再点第二行）选中单行/连续区间 → 行内编辑器；旧行号锚 old 侧（删除行），其余缺省锚 new 侧；
      shift 点击无条件延伸区间。保存 = 草稿入 store；再点同一点 = 收起/取消选中。
@@ -92,6 +99,14 @@ Agent 收到后按行号/侧注记定位，修复被指出的评论并重新提�
 - **角色检测**：同一 bundle 挂两个角色 —— 宿主容器带 `plugin-page-host` 类（`PluginPage.tsx:128`）= 导航器，
   否则（`plugin-view`，`PluginView.tsx:42`）= 查看器（默认-else）。这两个类是宿主**内部实现细节**而非文档化插件 API
   （spec §193 记录的 Phase 1 决策）；判定收口在 `client/entry.mjs` 的 `detectRole()` —— 宿主改类名时只改这一处。
+- **内嵌面板（R17）**：宿主没有「替换主区局部」的插件 API，内嵌形态是客户端 DOM 集成，依赖三处宿主内部细节：
+  聊天主区结构类名 `main.main` + `.messages-wrap`（宿主 ChatMain）、面板可见性开关 `view-pane` 的 `hidden` 类、
+  聊天视图 id `"chat"`（`setView` 目标）、模态容器类 `plugin-modal-body`（模态形态点文件先关弹窗）。
+  全部收口在 `client/inline.mjs`（`defaultLocate` / `INLINE_CSS` / `HOST_MODAL_BODY_CLASS` 三处）——
+  宿主改结构时只改这三个地方。集成方式：给 `.messages-wrap`
+  挂 `data-gr-inline` 属性（配套样式隐藏其直接子元素，消息列表/回到底部/排队栏让位）并追加 `.gr-inline-host`
+  容器装 viewer；只动 React 不管理的属性/追加子节点，对话切换（`.messages-wrap` 按 conversationId 重挂）由
+  MutationObserver 驱动 `sync()` 重新落座。内嵌锚定位失败时自动回落 `setView` 全屏（文件点击永不死路）。
 - **草稿并入语义**：`compose({text})` 只投文本、绝不读改既有草稿（宿主 `composer-bridge.ts` 全有或全无拒收；
   `composer-draft.ts mergeRecalledDraft` 并入）。
 - 其余桥触点都是文档化宿主 API：`setView`（R7）、`onLocale`（R12，change-only）、`onData` 广播（cwd 变化重拉）。
@@ -102,7 +117,7 @@ Agent 收到后按行号/侧注记定位，修复被指出的评论并重新提�
 面板对齐），客户端是裸 ESM（`client/*.mjs`，`textContent`-only DOM，无 npm import、无共享 React）。
 
 ```sh
-node --test test/     # 全部套件（gitcore 解析器 / server-smoke 真仓库路由 / tree-route / navigator / viewer / comments）
+node --test test/     # 全部套件（gitcore 解析器 / server-smoke 真仓库路由 / tree-route / navigator / viewer / inline / comments）
 node --check <file>   # 逐文件语法
 ```
 

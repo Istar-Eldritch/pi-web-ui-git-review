@@ -20,6 +20,10 @@
  *
  * 纯逻辑（行模型、树构建、错误分类、基线展示、无 marker 预选）导出为独立函数，
  * node --test 用极小假 DOM 直接驱动整个视图（见 test/navigator.test.mjs）。
+ *
+ * Phase 5（R17）：文件点击改走**内嵌优先** —— createNavigator 新增可选
+ * opts.openFile（entry 注入 inline.open：diff 装进聊天主区的消息面板位置，
+ * 输入框留在原地）；未注入（测试/兑底）保留旧的 setView 全屏切换（R7）。
  */
 import { DEFAULT_BASE_CANDIDATES } from "./gitcore.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
@@ -341,6 +345,8 @@ export function ensureStyles(doc) {
  *   fetchImpl  fetch 注入（缺省全局 fetch；测试用桩替换）
  *   document   DOM 文档（缺省全局 document；测试注入极小假 DOM）
  *   ctx        宿主 mount 上下文（只消费 onData：服务端 cwd-changed 广播 → 重拉）
+ *   openFile   可选：文件点击的展示入口（R17 内嵌优先；entry 注入 inline.open）。
+ *              缺省 = activateMainView()（旧的全屏切换，R7；桥不可用时安静降级）。
  *   lang       初始语言（缺省 detectLang()；测试固定用）
  *
  * 共享状态一律走 ./store.mjs 单例（模块级；node --test 用 setter 复位后直测）。
@@ -523,11 +529,15 @@ export function createNavigator(opts = {}) {
 				row.append(el("span", { class: `gr-flag${isUntracked ? " untracked" : ""}`, text: label }));
 			}
 			row.addEventListener("click", () => {
-				// R7：选中进共享 store（{path, base} 原子写入 —— viewer 对任一变化重拉
-				// /diff），并把主区切到插件视图（R7；桥不可用时安静降级 no-op）。
+				// R7/R17：选中进共享 store（{path, base} 原子写入 —— viewer 对任一变化重拉
+				// /diff）。展示内嵌优先（R17）：entry 注入 openFile —— inline 控制器把
+				// diff 装进聊天主区的消息面板位置（输入框留在原地），锚找不到时它自己
+				// 回落全屏；未注入 openFile（测试/兑底）→ 旧的 setView 全屏切换（桥不可
+				// 用时安静降级 no-op）。
 				const override = store.getState().baseOverride;
 				store.setSelection({ path: file.path, base: override?.ref ?? review?.base?.ref ?? null });
-				activateMainView();
+				if (typeof opts.openFile === "function") opts.openFile();
+				else activateMainView();
 			});
 		} else {
 			main.append(el("div", { class: "gr-name", text: name }));

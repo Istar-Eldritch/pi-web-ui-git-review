@@ -94,6 +94,9 @@ export const DICT = {
 		"viewer.foldHint": "点击展开上下文",
 		"viewer.collapse": "折叠上下文",
 
+		// Phase 5（R17）：内嵌面板的还原入口（opts.onClose 注入才有此按钮）。
+		"viewer.close": "关闭",
+
 		// Phase 4（R9）：行内评论编辑器 + 草稿列表 + 文件级入口。
 		"viewer.fileComment": "评论整个文件",
 		"viewer.comments.title": "评论草稿（{n}）",
@@ -189,6 +192,9 @@ export const DICT = {
 		"viewer.fold": "⋯ {n} unchanged lines",
 		"viewer.foldHint": "Click to expand context",
 		"viewer.collapse": "Collapse context",
+
+		// Phase 5（R17）：inline panel restore entry (rendered only with opts.onClose).
+		"viewer.close": "Close",
 
 		// Phase 4 (R9): inline comment editor + draft list + file-level affordance.
 		"viewer.fileComment": "Comment on file",
