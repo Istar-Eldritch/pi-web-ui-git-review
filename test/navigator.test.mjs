@@ -252,6 +252,30 @@ describe("navigator pure helpers", () => {
 		assert.equal(navModule.flattenTree(tree, new Set()).length, 7); // 3 目录 + 4 文件，全展开
 	});
 
+	it("aggregates per-dir add/del through object entries and sums the row contract (R19)", () => {
+		// 对象条目：{ path, add, del } 带入行数；字符串条目行数保持 0（向后兼容）
+		const tree = navModule.buildTree(
+			[
+				{ path: "src/one.txt", add: 3, del: 1 },
+				{ path: "src/deep/two.txt", add: 1, del: 2 },
+				{ path: "top.txt", add: 2, del: 0 },
+				"src/plain.txt",
+			],
+			() => true,
+		);
+		const src = tree.find((node) => node.path === "src");
+		assert.equal(src.add, 4); // 子树求和：3+1，plain.txt 字符串条目不计
+		assert.equal(src.del, 3); // 1+2
+		const deep = src.children.find((node) => node.path === "src/deep");
+		assert.deepEqual(deep.add, 1);
+		assert.deepEqual(deep.del, 2);
+		const plain = src.children.find((node) => node.path === "src/plain.txt");
+		assert.deepEqual({ add: plain.add, del: plain.del, changed: plain.changed }, { add: 0, del: 0, changed: true });
+		// 头部聚合：对行契约 add/del 的 sum（截断时只覆盖已列出文件，与清单一致）
+		assert.deepEqual(navModule.sumAddDel([{ add: 1, del: 2 }, { add: 3, del: 0 }, {}, null]), { add: 4, del: 2 });
+		assert.deepEqual(navModule.sumAddDel("junk"), { add: 0, del: 0 });
+	});
+
 	it("preselects the first resolvable mainline candidate via /resolve (R4)", async () => {
 		const attempts = [];
 		const resolveRef = async (ref) => {
@@ -299,6 +323,23 @@ describe("navigator file rows (phase-1 row contract)", () => {
 		assert.deepEqual(flagsOf(binary), []);
 		assert.ok(!binary.text.includes("+") && !binary.text.includes("−"));
 
+		view.destroy();
+	});
+
+	it("shows the whole-review aggregate in the head and per-dir aggregates in tree layout (R19)", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		// 头部标题行：REVIEW_FILES 的 add/del sum = +5 −2（REVIEW_FILES：1+0+2+1+1，del 0+1+1）
+		assert.equal(view.model.els.totals.textContent, "+5−2");
+		assert.equal(collect(view.model.els.totals, "gr-add")[0]?.textContent, "+5");
+		assert.equal(collect(view.model.els.totals, "gr-del")[0]?.textContent, "−2");
+
+		// 树形：目录行右缘展示子树聚合（dir/ 子树 = dir/new.txt 的 +1 −0 → 零值部分省略）
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "树").click();
+		const dirrow = collect(view.root, "gr-dirrow").find((row) => row.dataset.dir === "dir");
+		assert.equal(collect(dirrow, "gr-add")[0]?.textContent, "+1");
+		assert.equal(collect(dirrow, "gr-del").length, 0);
+		assert.equal(collect(dirrow, "gr-dircnt").length, 0); // 有真实行数时旧的「+N 变更文件」徽标不并排
 		view.destroy();
 	});
 

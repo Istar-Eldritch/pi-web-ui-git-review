@@ -28,6 +28,9 @@
  * Phase 5（R18）：全树模式未变更文件行也可点击 —— 同一选中通道（store 共享
  * 选中）进 viewer；/diff 对这类文件返回范围外空态时 viewer 链式取 /blob 预览
  * 全文，行级评论照常可用（未变更文件基线/HEAD/工作树三处同内容）。
+ *
+ * R19：目录级聚合增删 —— buildTree 条目支持 {path,add,del} 对象形态，目录行在
+ * 右缘展示子树求和的 +add −del（与文件行同款计数列）；头部标题行展示全评审聚合。
  */
 import { DEFAULT_BASE_CANDIDATES } from "./gitcore.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
@@ -127,16 +130,23 @@ export function baseDisplay(review, override, markerSha = null, suggestedBase = 
 }
 
 /**
- * 从平铺路径在客户端建目录树（R6 tree 模式）。
- * 返回节点数组：{ kind:"dir", name, path, depth, children, changed }
- *             | { kind:"file", name, path, depth, changed }
- * changed 是「这个文件/这棵子树下有多少变更文件」（isChanged(path)→bool）。
+ * 从平铺条目在客户端建目录树（R6 tree 模式；R19 起条目支持对象形态）。
+ * 条目 = 字符串路径 | { path, add, del }（对象形态带入行数，R19 目录级聚合的原料）。
+ * 返回节点数组：{ kind:"dir", name, path, depth, children, changed, add, del }
+ *             | { kind:"file", name, path, depth, changed, add, del }
+ * changed 是「这个文件/这棵子树下有多少变更文件」（isChanged(path)→bool）；
+ * add/del 是「这个文件/这棵子树的聚合增删行数」（字符串条目为 0，目录 = 子树求和）。
  * 目录排前、同名按字典序；depth = 目录深度（根下文件为 0）。
  */
-export function buildTree(paths, isChanged = () => false) {
+export function buildTree(entries, isChanged = () => false) {
+	const norm = (Array.isArray(entries) ? entries : []).map((e) =>
+		typeof e === "string"
+			? { path: e, add: 0, del: 0 }
+			: { path: String(e?.path ?? ""), add: Number(e?.add ?? 0) || 0, del: Number(e?.del ?? 0) || 0 },
+	);
 	const roots = [];
-	for (const raw of [...paths].sort()) {
-		const segs = String(raw).split("/");
+	for (const item of norm.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+		const segs = item.path.split("/");
 		let parent = roots;
 		const acc = [];
 		for (let i = 0; i < segs.length - 1; i++) {
@@ -144,18 +154,28 @@ export function buildTree(paths, isChanged = () => false) {
 			const dirPath = acc.join("/");
 			let dir = parent.find((n) => n.kind === "dir" && n.path === dirPath);
 			if (!dir) {
-				dir = { kind: "dir", name: segs[i], path: dirPath, depth: i, children: [], changed: 0 };
+				dir = { kind: "dir", name: segs[i], path: dirPath, depth: i, children: [], changed: 0, add: 0, del: 0 };
 				parent.push(dir);
 			}
 			parent = dir.children;
 		}
-		parent.push({ kind: "file", name: segs[segs.length - 1], path: String(raw), depth: segs.length - 1, changed: isChanged(raw) });
+		parent.push({
+			kind: "file",
+			name: segs[segs.length - 1],
+			path: item.path,
+			depth: segs.length - 1,
+			changed: isChanged(item.path),
+			add: item.add,
+			del: item.del,
+		});
 	}
 	const finalize = (nodes) => {
 		for (const n of nodes) {
 			if (n.kind !== "dir") continue;
 			finalize(n.children);
 			n.changed = n.children.reduce((sum, c) => sum + (c.kind === "dir" ? c.changed : c.changed ? 1 : 0), 0);
+			n.add = n.children.reduce((sum, c) => sum + c.add, 0);
+			n.del = n.children.reduce((sum, c) => sum + c.del, 0);
 		}
 		nodes.sort((a, b) => {
 			if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
@@ -164,6 +184,20 @@ export function buildTree(paths, isChanged = () => false) {
 	};
 	finalize(roots);
 	return roots;
+}
+
+/**
+ * R19：行契约 add/del 的聚合 sum（头部全评审聚合用；截断时只覆盖已列出文件，
+ * 与清单一致 —— 截断上限语义 R16 的 total 保全只针对条数）。
+ */
+export function sumAddDel(files) {
+	let add = 0;
+	let del = 0;
+	for (const f of Array.isArray(files) ? files : []) {
+		add += Number(f?.add ?? 0) || 0;
+		del += Number(f?.del ?? 0) || 0;
+	}
+	return { add, del };
 }
 
 /** 树节点 → 渲染序列；折叠的目录跳过子树（collapsed: Set<dirPath>）。 */
@@ -270,6 +304,8 @@ export const NAVIGATOR_CSS = `
 .gr-flag { flex: none; font-size: 10px; padding: 0 5px; border-radius: 7px; border: 1px solid var(--gr-border); color: var(--gr-dim); white-space: nowrap; }
 .gr-flag.untracked { color: var(--gr-amber); border-color: currentColor; }
 .gr-dirrow { display: flex; align-items: center; gap: 5px; padding: 3px 8px; cursor: pointer; color: var(--gr-dim); font-size: 12px; }
+/* R19：目录级聚合计数 —— 右缘对齐文件行的计数列（复用 gr-counts/gr-add/gr-del）。 */
+.gr-dirrow .gr-counts { font-size: 10.5px; }
 .gr-dirrow:hover { color: var(--text, #e6e8ef); background: var(--gr-hover); }
 .gr-caret { flex: none; width: 10px; text-align: center; }
 .gr-dirname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -454,6 +490,12 @@ export function createNavigator(opts = {}) {
 			el("div", { class: "gr-titlerow" }, [
 				el("span", { class: "gr-title", text: `🔀 ${t("nav.title")}` }),
 				review ? el("span", { class: "gr-count", text: t("nav.count", { n: review.total }) }) : null,
+				// R19：全评审聚合增删（对象条目 sum review.files；截断时 = 已列出文件的聚合）。
+				(model.els.totals = (() => {
+					if (!review) return null;
+					const t = sumAddDel(review.files);
+					return countsSpan(t.add, t.del);
+				})()),
 				el("span", { class: "gr-grow" }),
 				(model.els.refreshBtn = el("button", { class: "gr-btn", text: t("nav.refresh"), onclick: () => refresh() })),
 			]),
@@ -478,6 +520,14 @@ export function createNavigator(opts = {}) {
 			]),
 		]);
 		return head;
+	}
+
+	/** `+add −del` 计数列（R19：文件行/目录行/头部聚合共用；零值部分省略，0/0 → 空列）。 */
+	function countsSpan(add, del) {
+		const span = el("span", { class: "gr-counts" });
+		if (add > 0) span.append(el("span", { class: "gr-add", text: `+${add}` }));
+		if (del > 0) span.append(el("span", { class: "gr-del", text: `−${del}` }));
+		return span;
 	}
 
 	function baseRefText(d) {
@@ -538,10 +588,7 @@ export function createNavigator(opts = {}) {
 			main.append(el("div", { class: "gr-name", text: name }));
 			if (sub) main.append(el("div", { class: "gr-sub", text: sub }));
 			row.append(main);
-			const counts = el("span", { class: "gr-counts" });
-			if (file.add > 0) counts.append(el("span", { class: "gr-add", text: `+${file.add}` }));
-			if (file.del > 0) counts.append(el("span", { class: "gr-del", text: `−${file.del}` }));
-			row.append(counts);
+			row.append(countsSpan(file.add, file.del));
 			const isUntracked = (file.flags ?? []).includes("untracked");
 			for (const label of flagLabels(file.flags, t)) {
 				row.append(el("span", { class: `gr-flag${isUntracked ? " untracked" : ""}`, text: label }));
@@ -572,7 +619,16 @@ export function createNavigator(opts = {}) {
 		});
 		row.append(el("span", { class: "gr-caret", text: isCollapsed ? "▸" : "▾" }));
 		row.append(el("span", { class: "gr-dirname", text: dir.name }));
-		if (dir.changed > 0) row.append(el("span", { class: "gr-dircnt", text: t("nav.tree.changedCount", { n: dir.changed }) }));
+		// R19 目录级聚合增删：右缘对齐文件行的计数列。子树有真实行数（add/del 有值）
+		// 时展示聚合；全 0 但确有变更文件（未跟踪/二进制行 add=del=0）才回退旧的
+		// 「+N 变更文件」徽标 —— 两种数字不做并排，避免绿色 +N（行数）与旧 +N（文件数）撞脸。
+		if (dir.add > 0 || dir.del > 0) {
+			row.append(el("span", { class: "gr-grow" }));
+			row.append(countsSpan(dir.add, dir.del));
+		} else if (dir.changed > 0) {
+			row.append(el("span", { class: "gr-grow" }));
+			row.append(el("span", { class: "gr-dircnt", text: t("nav.tree.changedCount", { n: dir.changed }) }));
+		}
 		row.addEventListener("click", () => {
 			if (collapsed.has(dir.path)) collapsed.delete(dir.path);
 			else collapsed.add(dir.path);
@@ -671,8 +727,9 @@ export function createNavigator(opts = {}) {
 		model.rows = [];
 		const fileMap = new Map(files.map((f) => [f.path, f]));
 		if (modes().layout === "tree") {
+			// R19：目录级聚合增删 —— 树条目用对象形态把行数带进 buildTree（子树求和）。
 			const nodes = buildTree(
-				files.map((f) => f.path),
+				files.map((f) => ({ path: f.path, add: f.add, del: f.del })),
 				() => true,
 			);
 			for (const n of flattenTree(nodes, collapsed)) {
@@ -715,7 +772,14 @@ export function createNavigator(opts = {}) {
 		const fileMap = new Map((review?.files ?? []).map((f) => [f.path, f]));
 		const box = el("div", { class: "gr-list" });
 		model.rows = [];
-		const nodes = buildTree(treeData.files, (p) => changedSet.has(p));
+		// R19：变更文件用对象形态带行数（目录级聚合增删照常展示），未变更文件保持字符串。
+		const nodes = buildTree(
+			treeData.files.map((p) => {
+				const f = fileMap.get(p);
+				return f ? { path: p, add: f.add, del: f.del } : p;
+			}),
+			(p) => changedSet.has(p),
+		);
 		for (const n of flattenTree(nodes, collapsed)) {
 			if (n.kind === "dir") {
 				box.append(dirRow(n, collapsed));
