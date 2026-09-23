@@ -55,6 +55,13 @@
  * hunk、old=new=1..n）。/blob 成功 → preview 态渲染（无 hunk 头、可选中可评论
  * —— 行号口径与 diff 一致，提交流程零特例）；失败 → 保留 /diff 的范围外空态。
  *
+ * R20 文件边界折叠：改动不在文件两端的未变更区同样可折叠 —— 首个 hunk 之前
+ * （空隙 = 行 1 虚锚到 hunk 起点，无需总行数）与最后一个 hunk 之后（尾部未变更
+ * 行 old/new 两侧一一对应 → 空隙 = 基线总行数 − 最后 hunk 声明终点；基线总行数
+ * 复用 /blob 全文预览的行数，按 (base, 旧侧路径) 记忆化，展开/收拢重拉不再取）。
+ * 两种空隙与 hunk 间空隙同一渲染、同一展开通道。补丁截断时两端都不画（最后的
+ * 可见 hunk 未必真在文件边界）。
+ *
  * 纯逻辑（折叠空隙计算、行模型、状态归类）导出为独立函数，node --test 用极小
  * 假 DOM + 桩 fetch 驱动整个视图（见 test/viewer.test.mjs；fixture 补丁文本
  * 一律经 Phase 1 的 parseUnifiedDiff 取行号 —— 与 git 输出同源）。
@@ -91,9 +98,13 @@ export function foldGapBetween(prevHunk, nextHunk) {
 	return Math.max(oldGap > 0 ? oldGap : 0, newGap > 0 ? newGap : 0);
 }
 
+/** 文件起点虚锚（行 1、0 行）：与 foldGapBetween 组合算首个 hunk 之前的空隙（R20）。 */
+const LEADING_ANCHOR = { oldStart: 1, oldLines: 0, newStart: 1, newLines: 0 };
+
 /**
  * 结构化 /diff 载荷 → 渲染行模型（无 DOM）。序列：
- *   { kind:"fold", gap, hunkIndex }         —— hunk i 与 i-1 之间的折叠空隙（i>0）
+ *   { kind:"fold", gap, hunkIndex, leading? } —— hunk i 与 i-1 之间的折叠空隙（i>0）；
+ *     或首个 hunk 之前的文件头空隙（i=0 且起点不在行 1，R20，leading:true）
  *   { kind:"hunk-header", hunk, hunkIndex } —— hunk 头行
  *   { kind:"line", hunk, line, hunkIndex, rowType } —— 逐行（parser 的 old/new 行号）
  */
@@ -105,11 +116,28 @@ export function buildDiffRows(payload) {
 		if (i > 0) {
 			const gap = foldGapBetween(hunks[i - 1], hunk);
 			if (gap > 0) rows.push({ kind: "fold", gap, hunkIndex: i });
+		} else {
+			// R20 文件头空隙：首个 hunk 不从行 1 开始时，其之前的未变更行同样可折叠
+			//（与 hunk 间空隙同一展开通道 —— 点击都是加宽 -U 重拉）。空隙 = 行 1 虚锚
+			//（0 行）到 hunk 起点；缺失侧头 0,0（新增/删除文件）算出 ≤0 → 无空隙不画。
+			const gap = foldGapBetween(LEADING_ANCHOR, hunk);
+			if (gap > 0) rows.push({ kind: "fold", gap, hunkIndex: 0, leading: true });
 		}
 		rows.push({ kind: "hunk-header", hunk, hunkIndex: i });
 		for (const line of hunk.lines ?? []) {
 			rows.push({ kind: "line", hunk, line, hunkIndex: i, rowType: line.type });
 		}
+	}
+	// R20 尾部空隙：最后一个 hunk 之后的未变更行同样可折叠。尾部未变更行在 old/new
+	// 两侧一一对应（同内容、同条数）→ 两侧空隙相等，用基线版本总行数 − 最后 hunk
+	// 声明终点（oldStart+oldLines−1）即可，无需 HEAD 侧总数。baseTotal 由客户端经
+	// /blob 取基线全文行数后附到载荷上（undefined = 未取到/不需要 → 不画；补丁截断
+	// 时最后的可见 hunk 未必是真最后 → 也不画）。
+	const last = hunks[hunks.length - 1];
+	if (last && payload && payload.truncated !== true && typeof payload.baseTotal === "number") {
+		const end = Number(last.oldStart) + Number(last.oldLines) - 1;
+		const gap = payload.baseTotal - end;
+		if (gap > 0) rows.push({ kind: "fold", gap, hunkIndex: hunks.length - 1, tail: true });
 	}
 	return rows;
 }
@@ -335,6 +363,7 @@ export function createViewer(opts = {}) {
 	let editorFromSelection = false; // 编辑器由选中打开（取消时要一并收起选中）
 	let editorMode = "add"; // "add" | "edit"（列表编辑按钮 → edit，标题切换）
 	let pathComments = []; // 当前路径的草稿快照（渲染序 = 提交序）
+	const tailTotals = new Map(); // R20 尾部折叠的基线总行数缓存（key = base\u0000旧侧路径）
 
 	// 挂载时刻的选中（store 已有选中 → 立即拉数；无 → R7 空态）。
 	const initial = store.getState();
@@ -425,6 +454,24 @@ export function createViewer(opts = {}) {
 				payload = null;
 				errorText = data?.error ?? "unknown error";
 			}
+			// R20 尾部折叠的基线总行数：正常行模式（有 hunk、非二进制/未跟踪/预览）才
+			// 需要；A/D 整文件都在 hunk 里（无尾部空隙）不白打，rename/copy 用旧路径取
+			// 基线全文。失败/超限/二进制 → 不附 baseTotal（不画尾折叠，不拦展示）。
+			const tailEligible =
+				payload &&
+				payload.truncated !== true &&
+				payload.binary !== true &&
+				payload.untracked !== true &&
+				payload.preview !== true &&
+				Array.isArray(payload.hunks) &&
+				payload.hunks.length > 0 &&
+				payload.status !== "A" &&
+				payload.status !== "D";
+			if (tailEligible) {
+				const tailTotal = await tailTotalFor(base, payload.oldPath ?? payload.path);
+				if (my !== seq) return;
+				if (typeof tailTotal === "number") payload = { ...payload, baseTotal: tailTotal };
+			}
 		} catch (err) {
 			if (my !== seq) return;
 			payload = null;
@@ -433,6 +480,36 @@ export function createViewer(opts = {}) {
 		if (my !== seq) return;
 		loading = false;
 		render();
+	}
+
+	/**
+	 * R20：基线版本全文行数（尾部空隙 = 总行数 − 最后 hunk 声明终点；尾部未变更
+	 * 行 old/new 两侧一一对应，无需 HEAD 侧总数）。走现有 /blob 全文预览（其单
+	 * hunk 的 oldLines = 全文行数）。按 (base, 旧侧路径) 记忆化 —— 展开/收拢的重拉
+	 * 不重复取全文；失败/超限/二进制记 undefined（本控制器生命周期内不再重试）。
+	 */
+	async function tailTotalFor(base, path) {
+		const key = `${base ?? ""}\u0000${path}`;
+		if (tailTotals.has(key)) return tailTotals.get(key);
+		let total;
+		try {
+			const res = await doFetch(apiUrl("/blob", { path, base }), { credentials: "same-origin" });
+			const text = await res.text();
+			let data;
+			try {
+				data = text ? JSON.parse(text) : {};
+			} catch {
+				throw new Error(`bad response (${res.status})`);
+			}
+			if (data?.ok && data.binary !== true && data.truncated !== true) {
+				const h0 = Array.isArray(data.hunks) ? data.hunks[0] : null;
+				total = h0 ? Number(h0.oldLines) || 0 : 0;
+			}
+		} catch {
+			total = undefined;
+		}
+		tailTotals.set(key, total);
+		return total;
 	}
 
 	/** 折叠空隙「点击展开」：宽度 3→24 再 ×2（封顶 MAX_CONTEXT，服务端校验同口径）。 */
@@ -730,7 +807,11 @@ export function createViewer(opts = {}) {
 			if (row.kind === "fold") {
 				const fold = el(
 					"div",
-					{ class: "gr-vfold", dataset: { gap: String(row.gap) }, title: t("viewer.foldHint") },
+					{
+						class: "gr-vfold",
+						dataset: { gap: String(row.gap), ...(row.tail ? { tail: "true" } : {}) },
+						title: t("viewer.foldHint"),
+					},
 					el("span", { class: "gr-vfoldgap", text: t("viewer.fold", { n: row.gap }) }),
 					el("span", { class: "gr-vfoldhint", text: t("viewer.foldHint") }),
 				);

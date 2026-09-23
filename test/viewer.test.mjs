@@ -231,6 +231,75 @@ const TRUNCATED_PATCH_TEXT = [
 	"-line one",
 ].join("\n");
 
+/* R20 fixture：首个 hunk 不从行 1 开始 —— 前 4 行未变更，折叠后应可展开 */
+const LEADING_GAP_PATCH = [
+	"diff --git a/late.txt b/late.txt",
+	"index 1111111..2222222 100644",
+	"--- a/late.txt",
+	"+++ b/late.txt",
+	"@@ -5,3 +5,4 @@",
+	" const a = 1;",
+	"-const b = 2;",
+	"+const b = 20;",
+	"+",
+	" const c = 3;",
+].join("\n");
+
+/* R20 fixture：context 加宽后文件头空隙闭合（hunk 回到行 1，ctx 带出行 1..4） */
+const LEADING_GAP_WIDE_PATCH = [
+	"diff --git a/late.txt b/late.txt",
+	"index 1111111..2222222 100644",
+	"--- a/late.txt",
+	"+++ b/late.txt",
+	"@@ -1,7 +1,8 @@",
+	" line one",
+	" line two",
+	" line three",
+	" line four",
+	" const a = 1;",
+	"-const b = 2;",
+	"+const b = 20;",
+	"+",
+	" const c = 3;",
+].join("\n");
+
+/* R20 fixture：改动在文件头部、末尾还有 7 行未变更（基线全文 10 行，/blob 桩提供总数） */
+const TAIL_PATCH = [
+	"diff --git a/tail.txt b/tail.txt",
+	"index 1111111..2222222 100644",
+	"--- a/tail.txt",
+	"+++ b/tail.txt",
+	"@@ -1,3 +1,4 @@",
+	" line one",
+	"-const b = 2;",
+	"+const b = 20;",
+	"+",
+	" line three",
+].join("\n");
+
+/* R20 fixture：context 加宽后尾部空隙闭合（hunk 覆盖 old 1..10 / new 1..11） */
+const TAIL_WIDE_PATCH = [
+	"diff --git a/tail.txt b/tail.txt",
+	"index 1111111..2222222 100644",
+	"--- a/tail.txt",
+	"+++ b/tail.txt",
+	"@@ -1,10 +1,11 @@",
+	" line one",
+	" line two",
+	"-const b = 2;",
+	"+const b = 20;",
+	"+",
+	" line six",
+	" line seven",
+	" line eight",
+	" line nine",
+	" line ten",
+	" line eleven",
+	" line twelve",
+].join("\n");
+
+const TAIL_BASE_TEXT = ["line one", "line two", "const b = 2;", "line four", "line five", "line six", "line seven", "line eight", "line nine", "line ten"].join("\n") + "\n";
+
 function diffRoutesFor() {
 	return {
 		"src/app.ts": (query) => (Number(query.context) >= 24 ? payloadFromPatch(WIDE_PATCH, "src/app.ts") : payloadFromPatch(MODIFIED_PATCH, "src/app.ts")),
@@ -239,6 +308,8 @@ function diffRoutesFor() {
 		"renamed/new.txt": () => payloadFromPatch(RENAMED_PATCH, "renamed/new.txt"),
 		"bin.dat": () => payloadFromPatch(BINARY_PATCH, "bin.dat"),
 		"big.log": () => payloadFromPatch(TRUNCATED_PATCH_TEXT, "big.log", { truncated: true }),
+		"late.txt": (query) =>
+			Number(query.context) >= 24 ? payloadFromPatch(LEADING_GAP_WIDE_PATCH, "late.txt") : payloadFromPatch(LEADING_GAP_PATCH, "late.txt"),
 		"untracked.txt": () => ({
 			ok: true,
 			path: "untracked.txt",
@@ -371,6 +442,44 @@ describe("viewer pure helpers", () => {
 		);
 		assert.deepEqual(viewerModule.buildDiffRows(payloadFromPatch(NEW_FILE_PATCH, "feature.txt")).filter((row) => row.kind === "fold"), []);
 		assert.deepEqual(viewerModule.buildDiffRows({ hunks: [] }), []);
+	});
+
+	it("emits a trailing fold after the last hunk from the base total (R20)", () => {
+		const rows = viewerModule.buildDiffRows(payloadFromPatch(TAIL_PATCH, "tail.txt", { baseTotal: 10 }));
+		// 尾空隙紧随最后一个 hunk 的行之后，gap = 基线总行数 − hunk 声明终点（10 − 3）
+		assert.deepEqual(rows[rows.length - 2].kind, "line");
+		assert.deepEqual(rows[rows.length - 1], { kind: "fold", gap: 7, hunkIndex: 0, tail: true });
+		// 终点已达/越过文件末尾 → 不画；未附 baseTotal（向后兼容）→ 不画；截断补丁 → 不画
+		assert.deepEqual(viewerModule.buildDiffRows(payloadFromPatch(TAIL_PATCH, "tail.txt", { baseTotal: 3 })).filter((row) => row.tail), []);
+		assert.deepEqual(viewerModule.buildDiffRows(payloadFromPatch(TAIL_PATCH, "tail.txt")).filter((row) => row.tail), []);
+		assert.deepEqual(viewerModule.buildDiffRows(payloadFromPatch(TAIL_PATCH, "tail.txt", { baseTotal: 10, truncated: true })).filter((row) => row.tail), []);
+		// 头空隙 + 尾空隙并存（改动夹在中间：late.txt hunk old 5..7，基线 9 行）
+		const both = viewerModule.buildDiffRows(payloadFromPatch(LEADING_GAP_PATCH, "late.txt", { baseTotal: 9 }));
+		assert.deepEqual(
+			both.filter((row) => row.kind === "fold").map((row) => [row.gap, row.leading ?? false, row.tail ?? false]),
+			[
+				[4, true, false],
+				[2, false, true],
+			],
+		);
+	});
+
+	it("emits a leading fold before the first hunk when the change starts past line 1 (R20)", () => {
+		const payload = payloadFromPatch(LEADING_GAP_PATCH, "late.txt");
+		const rows = viewerModule.buildDiffRows(payload);
+		// 序列：文件头空隙 fold（leading:true）→ 首个 hunk 头 → 行
+		assert.deepEqual(
+			rows.slice(0, 2).map((row) => [row.kind, row.gap ?? null, row.leading ?? false]),
+			[
+				["fold", 4, true],
+				["hunk-header", null, false],
+			],
+		);
+		assert.equal(rows[1].hunkIndex, 0); // 空隙归属首个 hunk
+		// hunk 从行 1 开始（MODIFIED_PATCH）→ 无文件头空隙；0,0 缺失侧（新增/删除）同免
+		const noLeading = viewerModule.buildDiffRows(payloadFromPatch(MODIFIED_PATCH, "src/app.ts"));
+		assert.equal(noLeading[0].kind, "hunk-header");
+		assert.deepEqual(viewerModule.buildDiffRows(payloadFromPatch(DELETED_PATCH, "gone.txt")).filter((row) => row.kind === "fold"), []);
 	});
 
 	it("classifies the display mode and header notes (R8 special cases)", () => {
@@ -637,6 +746,120 @@ describe("viewer fold expand/collapse", () => {
 		);
 		assert.equal(view.model.els.collapseBtn, undefined);
 		assert.ok(server.calls.length > callsBefore);
+		view.destroy();
+	});
+
+	it("leading gap before the first hunk folds and expands like between-hunk gaps (R20)", async () => {
+		const { view, server } = await mountViewer("late.txt");
+		const folds = foldRowsOf(view.root);
+		assert.equal(folds.length, 1);
+		assert.equal(folds[0].gap, "4");
+		assert.ok(folds[0].text.includes("4"), "fold text must state the gap size");
+		// 折叠行落在首个 hunk 头之前（文档序）
+		const box = collect(view.root, "gr-vdiff")[0];
+		assert.ok(box.childNodes.indexOf(folds[0].el) < box.childNodes.indexOf(collect(view.root, "gr-vhunkhead")[0]));
+
+		folds[0].el.click();
+		await assertEventually(
+			() => server.calls.some((call) => call.route === "/diff" && call.query.context === "24"),
+			"leading-fold expand must request /diff with context=24",
+		);
+		// 加宽载荷真的渲染完成（loading 态里 fold 与 hunk 头都为空 —— 只等 fold 消失会撞上过渡帧）
+		await assertEventually(
+			() => foldRowsOf(view.root).length === 0 && collect(view.root, "gr-vhunkhead").some((head) => head.textContent === "@@ -1,7 +1,8 @@"),
+			"wide payload must close the leading gap",
+		);
+		// 原空隙行（old 1..4）以 ctx 呈现在变更之前
+		const leading = lineRowsOf(view.root).filter((row) => row.type === "ctx" && row.old >= 1 && row.old <= 4);
+		assert.deepEqual(
+			leading.map((row) => [row.old, row.new]),
+			[
+				[1, 1],
+				[2, 2],
+				[3, 3],
+				[4, 4],
+			],
+		);
+		view.destroy();
+	});
+
+	it("trailing gap after the last hunk folds, expands, and survives collapse via the memoized total (R20)", async () => {
+		resetStore();
+		store.setSelection({ path: "tail.txt", base: "main" });
+		const server = createStubServer({
+			"tail.txt": (query) => (Number(query.context) >= 24 ? payloadFromPatch(TAIL_WIDE_PATCH, "tail.txt") : payloadFromPatch(TAIL_PATCH, "tail.txt")),
+			"/blob": blobRouteFor(TAIL_BASE_TEXT),
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+
+		const folds = foldRowsOf(view.root);
+		assert.equal(folds.length, 1);
+		assert.equal(folds[0].gap, "7");
+		assert.equal(folds[0].el.dataset.tail, "true");
+		// 尾折叠是 diff 主体的最后一个元素（文档序在所有行之后）
+		const box = collect(view.root, "gr-vdiff")[0];
+		assert.equal(box.childNodes[box.childNodes.length - 1], folds[0].el);
+
+		folds[0].el.click();
+		await assertEventually(
+			() => server.calls.some((call) => call.route === "/diff" && call.query.context === "24"),
+			"tail-fold expand must request /diff with context=24",
+		);
+		// 加宽载荷真的渲染完成（loading 态里 fold 与 hunk 头都为空）
+		await assertEventually(
+			() => foldRowsOf(view.root).length === 0 && collect(view.root, "gr-vhunkhead").some((head) => head.textContent === "@@ -1,10 +1,11 @@"),
+			"wide payload must close the trailing gap",
+		);
+		// 原空隙行（old 4..10）以 ctx 呈现，old/new 行号连续
+		assert.deepEqual(
+			lineRowsOf(view.root).filter((row) => row.type === "ctx" && row.old >= 4).map((row) => [row.old, row.new]),
+			[
+				[4, 5],
+				[5, 6],
+				[6, 7],
+				[7, 8],
+				[8, 9],
+				[9, 10],
+				[10, 11],
+			],
+		);
+
+		// 收拢：回缺省宽度，尾折叠恢复；全程 /blob 只取一次（记忆化，展开/收拢重拉不重复取）
+		view.model.els.collapseBtn.click();
+		await assertEventually(
+			() => foldRowsOf(view.root).length === 1 && server.calls.some((call) => call.route === "/diff" && call.query.context === undefined),
+			"collapse must restore the tail fold without the context parameter",
+		);
+		assert.equal(server.calls.filter((call) => call.route === "/blob").length, 1, "tail total is memoized across expand/collapse refetches");
+		view.destroy();
+	});
+
+	it("tail total for renames reads the OLD path from /blob (R20)", async () => {
+		resetStore();
+		store.setSelection({ path: "renamed/new.txt", base: "main" });
+		const blobPaths = [];
+		const server = createStubServer({
+			"renamed/new.txt": () => payloadFromPatch(RENAMED_PATCH, "renamed/new.txt"),
+			"/blob": (query) => {
+				blobPaths.push(query.path);
+				return blobRouteFor("a\nb\nc\nd\ne\n")();
+			},
+		});
+		const view = viewerModule.createViewer({
+			document: new FakeDocument(),
+			apiBase: "/plugins-api/git-review",
+			fetchImpl: server.fetchImpl,
+			lang: "zh",
+		});
+		await view.refresh();
+		assert.deepEqual(blobPaths, ["renamed/old.txt"], "rename tail totals must read the old path");
+		assert.deepEqual(foldRowsOf(view.root).map((fold) => fold.gap), ["4"]); // 5 − 1
 		view.destroy();
 	});
 
@@ -1051,6 +1274,8 @@ describe("viewer store-driven refetch", () => {
 		// 导航点击的等价动作：{path, base} 原子写入 → 拉取
 		store.setSelection({ path: "src/app.ts", base: "main" });
 		await assertEventually(() => server.calls.some((call) => call.route === "/diff" && call.query.path === "src/app.ts" && call.query.base === "main"));
+		// R20：装载还包含尾部总行数的一次 /blob —— 等它落地再取计数基线
+		await assertEventually(() => server.calls.some((call) => call.route === "/blob" && call.query.path === "src/app.ts"));
 
 		// 完全相同的写入（值未变）→ setSelection 不通知 → 不重拉
 		const callsAfterFirst = server.calls.length;
@@ -1061,6 +1286,8 @@ describe("viewer store-driven refetch", () => {
 		// 基线变化（导航把选中重同步到新基线）→ 带 base 重拉
 		store.setSelection({ path: "src/app.ts", base: "origin/main" });
 		await assertEventually(() => server.calls.some((call) => call.route === "/diff" && call.query.base === "origin/main"));
+		// 新基线的尾部总行数 /blob 也落地后再取计数基线
+		await assertEventually(() => server.calls.some((call) => call.route === "/blob" && call.query.base === "origin/main"));
 
 		// 无关写入（视图模式等）→ fetch-key 比对跳过
 		const callsAfterBase = server.calls.length;
