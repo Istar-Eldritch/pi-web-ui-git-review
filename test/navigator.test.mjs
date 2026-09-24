@@ -456,7 +456,8 @@ describe("navigator file filter (R24)", () => {
 		assert.ok(kids[2].classList.contains("gr-toolbar"));
 		assert.equal(view.model.els.filterInput.value, "");
 		assert.equal(view.model.els.filterInput.getAttribute("placeholder"), "筛选文件…");
-		assert.equal(collect(view.root, "gr-filter-clear").length, 0); // 空筛选无清除按钮
+		// R24a：清除按钮常驻 DOM，空查询时以 hidden 属性隐藏（body-only 输入路径不重建行）
+		assert.notEqual(view.model.els.filterClearBtn.getAttribute("hidden"), null, "clear button hidden while the query is empty");
 		view.destroy();
 
 		// 空评审 → 无清单可筛 → 行不出现
@@ -516,7 +517,7 @@ describe("navigator file filter (R24)", () => {
 		view.model.els.filterInput.value = "DIR"; // 大小写不敏感
 		view.model.els.filterInput.dispatch("input");
 		assert.deepEqual(rowsOf(view.root).map((row) => row.path), ["dir/new.txt"]);
-		// 重渲染后 model.els.filterInput 是新元素，值被恢复
+		// R24a：输入走 body-only 重渲染 —— 输入框元素原地保留（焦点/光标不丢）
 		assert.equal(view.model.els.filterInput.value, "DIR");
 
 		// rename 旧路径（行上可见的 old → new 文案）也参与命中
@@ -536,13 +537,14 @@ describe("navigator file filter (R24)", () => {
 			collect(view.root, "gr-state")[0].textContent.includes("zzz"),
 			"no-match state names the query",
 		);
-		// 行还在筛时清除按钮可点；恢复全量后按钮消失
+		// 行还在筛时清除按钮可见可点；恢复全量后按钮回到隐藏态
 		const clear = view.model.els.filterClearBtn;
 		assert.ok(clear, "clear button shows while a filter is active");
+		assert.equal(clear.getAttribute("hidden"), null, "clear button visible while filtering");
 		clear.click();
 		assert.deepEqual(rowsOf(view.root).map((row) => row.path), REVIEW_FILES.map((file) => file.path));
 		assert.equal(view.model.els.filterInput.value, "");
-		assert.equal(collect(view.root, "gr-filter-clear").length, 0);
+		assert.notEqual(view.model.els.filterClearBtn.getAttribute("hidden"), null, "clear button hidden again once the query is empty");
 		view.destroy();
 	});
 
@@ -589,18 +591,42 @@ describe("navigator file filter (R24)", () => {
 		view.destroy();
 	});
 
-	it("defers re-render during IME composition until compositionend", async () => {
+	// R24a 回归护栏：首版每键全量重渲染 + 在未挂载元素上 focus()（no-op）→ 真实
+	// 浏览器里每键失焦。修复后输入只重建清单主体，输入框元素必须原地不动。
+	it("never rebuilds the filter input while typing (focus/caret survive)", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		const before = view.model.els.filterInput;
+		const parentBefore = before.parentNode;
+		before.value = "keep";
+		before.dispatch("input");
+		const after = view.model.els.filterInput;
+		assert.equal(after, before, "typing must not rebuild the filter input element");
+		assert.equal(after.parentNode, parentBefore, "the input must stay in place (no re-seat)");
+		assert.equal(after.value, "keep");
+		// 清单本身确实被筛了（body-only 更新生效）
+		assert.deepEqual(rowsOf(view.root).map((row) => row.path), ["keep.txt"]);
+
+		// 连续击键依旧同元素
+		before.value = "keep.txt";
+		before.dispatch("input");
+		assert.equal(view.model.els.filterInput, before);
+		view.destroy();
+	});
+
+	it("filters live during IME composition — the input element is never touched", async () => {
 		resetStore();
 		const { view } = await mountNavigator(standardRoutes());
 		const input = view.model.els.filterInput;
 		input.value = "keep";
 		input.dispatch("input", { isComposing: true });
-		// 组合中：不重渲染 —— 列表保持全量、输入框元素未重建
-		assert.equal(rowsOf(view.root).length, REVIEW_FILES.length);
-		assert.equal(view.model.els.filterInput, input);
-		// 组合结束 → 统一筛
+		// R24a：body-only 更新不碰输入框 → 组合中即筛选（不再需要延后到 compositionend）
+		assert.deepEqual(rowsOf(view.root).map((row) => row.path), ["keep.txt"]);
+		assert.equal(view.model.els.filterInput, input, "composition must not rebuild the input");
+		// compositionend 是兜底同步：正常时最后一个 input 事件已带最终结果 → 幂等无操作
 		input.dispatch("compositionend");
 		assert.deepEqual(rowsOf(view.root).map((row) => row.path), ["keep.txt"]);
+		assert.equal(view.model.els.filterInput, input);
 		view.destroy();
 	});
 });

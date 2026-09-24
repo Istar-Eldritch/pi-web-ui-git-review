@@ -23,7 +23,7 @@
  *
  * Phase 5（R17）：文件点击改走**内嵌优先** —— createNavigator 新增可选
  * opts.openFile（entry 注入 inline.open：diff 装进聊天主区的消息面板位置，
- * 输入框留在原地）；未注入（测试/兑底）保留旧的 setView 全屏切换（R7）。
+ * 输入框留在原地）；未注入（测试/兜底）保留旧的 setView 全屏切换（R7）。
  *
  * Phase 5（R18）：全树模式未变更文件行也可点击 —— 同一选中通道（store 共享
  * 选中）进 viewer；/diff 对这类文件返回范围外空态时 viewer 链式取 /blob 预览
@@ -36,6 +36,9 @@
  * 对完整路径做大小写不敏感的子串匹配（rename 的 oldPath 也参与命中），树形/平铺、
  * 仅变更/全树共用；筛选激活时忽略目录折叠态（匹配项可能在折叠的目录里），清除后
  * 恢复折叠记忆。无匹配时给空态文案，不出现空白列表。
+ * R24a：输入只重建清单主体（renderBodyOnly），输入框元素原地保留 —— 焦点/光标/
+ * IME 组合态天然不受影响；焦点恢复放在元素挂载之后（detached 上 focus() 是
+ * no-op，首版每键失焦的根因，假 DOM 无焦点语义测不出来）。
  */
 import { DEFAULT_BASE_CANDIDATES } from "./gitcore.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
@@ -598,62 +601,99 @@ export function createNavigator(opts = {}) {
 	}
 
 	/**
-	 * R24：文件筛选行（工具条正上方）。输入即筛：重渲染后由 refocus 把焦点接回
-	 * 新输入框、光标挪到末尾（真 DOM；假 DOM 缺 focus/setSelectionRange 时安静
-	 * 跳过）。IME 组合中只记值不重渲染（重Render 会打断输入法候选），compositionend
-	 * 再统一筛。非空查询时附清除按钮。
+	 * R24：文件筛选行（工具条正上方）。输入即筛：R24a 起走 renderBodyOnly() ——
+	 * 只重建清单主体，输入框元素原地保留，焦点/光标/IME 组合态天然不受影响。
+	 * （首版全量重渲染 + 事后 focus() 每键失焦：focus 落在尚未挂载的元素上是不
+	 * 生效的 no-op，假 DOM 没有焦点语义所以测试没拦住。）compositionend 只作兜底
+	 * 同步（正常情况下最后一个 input 事件已带最终组合结果；幂等）。
+	 * 非空查询时附清除按钮（点击需要全量 render 撤按钮，render 末尾把焦点接回输入框）。
 	 */
-	function renderFilterRow(refocus = false) {
+	function renderFilterRow() {
 		const input = (model.els.filterInput = el("input", {
 			class: "gr-filter-input",
 			placeholder: t("nav.filter.placeholder"),
 			value: filterText,
 			dataset: { role: "filter" },
 		}));
-		input.addEventListener("input", (event) => {
+		input.addEventListener("input", () => {
 			filterText = input.value;
-			if (event?.isComposing) return; // IME 组合中：不重渲染
-			refocusFilter = true;
-			render();
+			updateForFilterChange();
 		});
 		input.addEventListener("compositionend", () => {
+			if (filterText === input.value) return; // input 事件已同步过 → 幂等
 			filterText = input.value;
-			refocusFilter = true;
-			render();
+			updateForFilterChange();
 		});
 		const row = el("div", { class: "gr-filterrow" }, [input]);
-		if (hasFilter()) {
-			row.append(
-				(model.els.filterClearBtn = el("button", {
-					class: "gr-btn gr-filter-clear",
-					text: "✕",
-					title: t("nav.filter.clear"),
-					onclick: () => {
-						filterText = "";
-						refocusFilter = true;
-						render();
-					},
-				})),
-			);
-		}
-		if (refocus) {
-			try {
-				if (typeof input.focus === "function") input.focus();
-				if (typeof input.setSelectionRange === "function") {
-					const end = input.value.length;
-					input.setSelectionRange(end, end);
-				}
-			} catch {
-				/* 焦点/选区不可用（假 DOM 等）→ 忽略 */
-			}
-		}
+		// R24a：清除按钮**常驻 DOM**，用 hidden 属性切换显隐 —— body-only 输入路径
+		// 不重建筛选行，无法事后插入/移除兄弟节点；真浏览器 hidden = display:none
+		//（离开 tab 序与无障碍树）。
+		model.els.filterClearBtn = el("button", {
+			class: "gr-btn gr-filter-clear",
+			text: "✕",
+			title: t("nav.filter.clear"),
+			hidden: !hasFilter(),
+			onclick: () => {
+				filterText = "";
+				refocusFilter = true; // render() 末尾把焦点接回输入框
+				render();
+			},
+		});
+		row.append(model.els.filterClearBtn);
 		return row;
+	}
+
+	/** R24a：清除按钮显隐随 hasFilter 同步（body-only 更新路径里唯一的行内变更）。 */
+	function syncFilterClear() {
+		const btn = model.els.filterClearBtn;
+		if (!btn) return;
+		if (hasFilter()) btn.removeAttribute("hidden");
+		else btn.setAttribute("hidden", "");
+	}
+
+	/** R24a：筛选值变化后的定点更新 —— 清单主体重建 + 清除按钮显隐同步。 */
+	function updateForFilterChange() {
+		renderBodyOnly();
+		syncFilterClear();
+	}
+
+	/**
+	 * R24a：筛选输入的轻量重渲染 —— 只重建清单主体，不碰筛选行本身。body 不在
+	 * （未挂载等异常态）→ 退回全量 render。筛选只影响清单，头部/工具条/摘要不动。
+	 */
+	function renderBodyOnly() {
+		const body = model.els.body;
+		if (!body || !body.parentNode) {
+			render();
+			return;
+		}
+		body.textContent = "";
+		body.append(renderBody());
+	}
+
+	/**
+	 * R24a：把焦点接回筛选输入框。必须在元素已挂到文档之后调用 —— detached
+	 * 元素上 focus() 是 no-op（R24 首版每键失焦的根因）。光标挪到末尾；假 DOM
+	 * 缺 focus/setSelectionRange 时安静跳过。
+	 */
+	function refocusFilterInput() {
+		const input = model.els.filterInput;
+		if (!input) return;
+		try {
+			if (typeof input.focus === "function") input.focus();
+			if (typeof input.setSelectionRange === "function") {
+				const end = String(input.value ?? "").length;
+				input.setSelectionRange(end, end);
+			}
+		} catch {
+			/* 焦点/选区不可用 → 忽略 */
+		}
 	}
 
 	/** 选中并打开（R7/R17/R18 共用入口）：{path, base} 原子写入共享 store（viewer
 	 *  对任一变化重拉 /diff，范围外时链式取 /blob 预览），展示内嵌优先（R17）——
 	 *  entry 注入 openFile（inline 控制器装进聊天主区消息面板位置，锚不到时它自己
-	 *  回落全屏）；未注入（测试/兑底）→ 旧的 setView 全屏切换（桥不可用时安静降级）。 */
+	 *  回落全屏）；未注入（测试/兜底）→ 旧的 setView 全屏切换（桥不可用时安静降级）。 */
 	function selectAndOpen(path) {
 		const override = store.getState().baseOverride;
 		store.setSelection({ path, base: override?.ref ?? review?.base?.ref ?? null });
@@ -1037,17 +1077,20 @@ export function createNavigator(opts = {}) {
 		model.rows = [];
 		model.notice = null;
 		root.textContent = "";
-		const refocus = refocusFilter; // 筛选输入触发的本轮 → 消费一次（见 renderFilterRow）
+		const refocus = refocusFilter; // 消费一次（清除筛选等 → 末尾接回焦点）
 		refocusFilter = false;
 		root.append(renderHead());
 		// R24：筛选行在工具条正上方；没有可筛的清单时整个行都不出现。
-		if (filterApplicable()) root.append(renderFilterRow(refocus));
+		if (filterApplicable()) root.append(renderFilterRow());
 		root.append(renderToolbar(), renderSummarySection());
 		const body = el("div", { class: "gr-body" });
+		model.els.body = body; // R24a：renderBodyOnly 的定点重建目标
 		body.append(renderBody());
 		root.append(body);
 		const noticeBar = renderNoticeBar();
 		if (noticeBar) root.append(noticeBar);
+		// R24a：焦点恢复必须在元素挂到文档之后（detached 上 focus() 不生效）。
+		if (refocus) refocusFilterInput();
 	}
 
 	/* ---- 数据装载 ---- */
