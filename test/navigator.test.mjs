@@ -1032,6 +1032,8 @@ describe("navigator row quick actions (R25)", () => {
 		assert.equal(ref.getAttribute("data-tip"), "仅引用路径（AI 按需读取）");
 		assert.equal(attach.getAttribute("data-tip"), "附加内容到对话");
 		assert.equal(copy.getAttribute("data-tip"), "复制路径");
+		// 非 rename 行没有旧路径芯片（R27：仅 rename 行多一枚）
+		assert.equal(collect(changed.el, "gr-act-old").length, 0, "non-rename rows carry no old-path chip");
 		assert.ok(
 			[ref, attach, copy].every((button) => button.getAttribute("aria-label") === button.getAttribute("data-tip")),
 			"aria-labels mirror the tooltips",
@@ -1163,6 +1165,64 @@ describe("dirname sub line placement (R26)", () => {
 		const flatAgain = rowsOf(view.root).find((row) => row.path === "src/lib/util.mjs");
 		assert.ok(flatAgain, "nested flat row renders again");
 		assert.deepEqual(collect(flatAgain.el, "gr-sub").map((n) => n.textContent), ["src/lib"], "dirname sub returns in flat list");
+		view.destroy();
+	});
+});
+
+describe("rename old-path affordances (R27)", () => {
+	it("rename sub carries the full old → new in a native tooltip; non-rename subs keep theirs", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		const renamed = rowsOf(view.root).find((row) => row.path === "dir/new.txt");
+		const subs = collect(renamed.el, "gr-sub");
+		assert.equal(subs.length, 1);
+		assert.equal(subs[0].getAttribute("title"), "dir/old.txt → dir/new.txt", "rename sub tooltip = full rename text");
+		const plain = rowsOf(view.root).find((row) => row.path === "keep.txt");
+		assert.equal(collect(plain.el, "gr-sub").length, 0);
+		view.destroy();
+	});
+
+	it("renamed rows gain a copy-old-path chip (FiCornerUpLeft) that copies the absolute old path", async () => {
+		resetStore();
+		const writes = [];
+		const { view } = await mountNavigator(standardRoutes(), {
+			clipboard: { writeText: async (text) => (writes.push(text), true) },
+		});
+		const renamed = rowsOf(view.root).find((row) => row.path === "dir/new.txt");
+		const oldChip = collect(renamed.el, "gr-act-old")[0];
+		assert.ok(oldChip, "renamed row carries the old-path chip");
+		assert.equal(oldChip.getAttribute("data-tip"), "复制改名前路径");
+		const svg = oldChip.childNodes.find((n) => typeof n !== "string" && String(n.tagName).toLowerCase() === "svg");
+		assert.equal(svg.childNodes.length, 2, "FiCornerUpLeft = polyline + path");
+
+		// 非 rename 行没有
+		const plain = rowsOf(view.root).find((row) => row.path === "keep.txt");
+		assert.equal(collect(plain.el, "gr-act-old").length, 0);
+
+		// 点击 → 复制的是旧路径（绝对路径），不触发行选中
+		const stopCalls = [];
+		oldChip.click({ stopPropagation: () => stopCalls.push(1) });
+		await assertEventually(() => writes.length === 1, "clipboard write must fire");
+		assert.deepEqual(writes, ["/repo/dir/old.txt"]);
+		assert.equal(stopCalls.length, 1);
+		assert.equal(store.getState().selectedPath, null, "copy-old click must not select the row");
+		await assertEventually(() => oldChip.classList.contains("gr-act-copied"), "copied flash lands on the old chip");
+		view.destroy();
+	});
+
+	it("rename sub tooltip and old chip also work in tree layout (full tree too)", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "全树").click();
+		await assertEventually(() => rowsOf(view.root).some((row) => row.path === "dir/new.txt"), "full tree must render");
+		const renamed = rowsOf(view.root).find((row) => row.path === "dir/new.txt");
+		assert.equal(collect(renamed.el, "gr-sub")[0]?.getAttribute("title"), "dir/old.txt → dir/new.txt");
+		assert.ok(collect(renamed.el, "gr-act-old")[0], "old-path chip present in full tree");
+
+		// 还原 scope —— store 的 viewModes 是模块级单例，跨套件共享（inline/comments
+		// 的 resetStore 不复位 viewModes）；留在 full 会让后续套件的导航挂载拉 /tree。
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "仅变更").click();
+		assert.equal(store.getState().viewModes.scope, "changed", "scope restored for downstream suites");
 		view.destroy();
 	});
 });

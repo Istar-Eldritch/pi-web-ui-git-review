@@ -447,7 +447,8 @@ const ICON_ATTR = {
 };
 
 /** 图标形状表（从宿主 bundle 逐字提取：ref=FiLink, attach=FiPlus,
- *  copy=FiClipboard, copied=FiCheck —— 复制成功态与宿主同款换勾图标）。 */
+ *  copy=FiClipboard, copied=FiCheck —— 复制成功态与宿主同款换勾图标；
+ *  old=FiCornerUpLeft（R27：复制改名前路径，宿主 react-icons 同源提取）。 */
 const ICONS = {
 	ref: [
 		{ tag: "path", attr: { d: "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" } },
@@ -462,6 +463,10 @@ const ICONS = {
 		{ tag: "rect", attr: { x: "8", y: "2", width: "8", height: "4", rx: "1", ry: "1" } },
 	],
 	copied: [{ tag: "polyline", attr: { points: "20 6 9 17 4 12" } }],
+	old: [
+		{ tag: "polyline", attr: { points: "9 14 4 9 9 4" } },
+		{ tag: "path", attr: { d: "M20 20v-7a4 4 0 0 0-4-4H4" } },
+	],
 };
 
 /** 图标 → SVG 元素（createElementNS 优先；缺 NS 支持的环境退 createElement ——
@@ -809,21 +814,47 @@ export function createNavigator(opts = {}) {
 	}
 
 	/**
-	 * R25/R25a：文件行悬停快捷动作（引 = 引用进草稿 / 附 = 全文内联进草稿 /
-	 * 复 = 复制绝对路径）。设计复刻宿主文件树的 file-attach 芯片：22×22 彩色软底 +
-	 * **同款 Feather 图标**（FiLink/FiPlus/FiClipboard，模块级 ICONS 逐字提取）+
-	 * **同款 tooltip 文案**（宿主 referenceTip/attachInlineTip/copyPath 原句，i18n
-	 * nav.act.*）+ data-tip 纯 CSS 气泡 + 悬停实底反转；复制成功换勾图标 + 闪绿
-	 * （宿主 copied 态同款）。stopPropagation —— 不触发行选中/打开；桥缺失时动作
-	 * 安静 no-op（宿主里桥恒在，测试可注入桩）。
+	 * R25/R25a/R27：文件行悬停快捷动作（引 = 引用进草稿 / 附 = 全文内联进草稿 /
+	 * 复 = 复制绝对路径；rename 行多一枚「复制旧路径」—— 长的 old → new 副行被
+	 * 截断，完整内容在副行原生 tooltip 里，旧路径可一键复制）。设计复刻宿主文件树
+	 * 的 file-attach 芯片：22×22 彩色软底 + **同款 Feather 图标**（FiLink/FiPlus/
+	 * FiClipboard/FiCornerUpLeft，模块级 ICONS 逐字提取）+ **同款 tooltip 文案**
+	 * （宿主 referenceTip/attachInlineTip/copyPath 原句，i18n nav.act.*）+ data-tip
+	 * 纯 CSS 气泡 + 悬停实底反转；复制成功换勾图标 + 闪绿（宿主 copied 态同款）。
+	 * stopPropagation —— 不触发行选中/打开；桥缺失时动作安静 no-op。
 	 */
-	function rowActionsEl(path) {
+	function rowActionsEl(file) {
+		const path = file.path;
 		const stop = (e) => {
 			try {
 				e?.stopPropagation?.();
 			} catch {
 				/* 事件对象不完整时忽略 —— 动作仍要执行 */
 			}
+		};
+		/** 复制成功反馈（宿主 copied 态）：换勾图标 + 闪绿，1.2s 后回落 restIcon。
+		 *  currentTarget 真 DOM 有；假 DOM 事件只有 target（同一节点）→ 兜底。 */
+		const flashCopied = (e, restIcon) => {
+			const chip = e?.currentTarget ?? e?.target;
+			if (!chip || typeof chip.classList?.add !== "function") return;
+			chip.classList.add("gr-act-copied");
+			try {
+				chip.textContent = "";
+				chip.append(svgIcon(doc, "copied"));
+			} catch {
+				/* 图标换不上不影响闪绿反馈 */
+			}
+			globalThis.setTimeout(() => {
+				try {
+					chip.classList.remove("gr-act-copied");
+					if (restIcon) {
+						chip.textContent = "";
+						chip.append(svgIcon(doc, restIcon));
+					}
+				} catch {
+					/* 行已重建（元素脱离）—— 无需回落 */
+				}
+			}, 1200);
 		};
 		const wrap = el("span", { class: "gr-acts" });
 		const refBtn = el("button", {
@@ -848,6 +879,23 @@ export function createNavigator(opts = {}) {
 			},
 		});
 		attachBtn.append(svgIcon(doc, "attach"));
+		// R27：rename 行的「复制旧路径」芯片（副行被截断，这里保证 old path 拿得到）。
+		const hasOldPath = typeof file.oldPath === "string" && file.oldPath !== "";
+		if (hasOldPath) {
+			const oldBtn = el("button", {
+				type: "button",
+				class: "gr-act gr-act-copy gr-act-old",
+				"data-tip": t("nav.act.copyOld"),
+				"aria-label": t("nav.act.copyOld"),
+				onclick: async (e) => {
+					stop(e);
+					const out = await rowActions.copyPath(file.oldPath);
+					if (out?.ok) flashCopied(e, "old");
+				},
+			});
+			oldBtn.append(svgIcon(doc, "old"));
+			wrap.append(oldBtn);
+		}
 		const copyBtn = el("button", {
 			type: "button",
 			class: "gr-act gr-act-copy",
@@ -858,26 +906,7 @@ export function createNavigator(opts = {}) {
 				const out = await rowActions.copyPath(path);
 				// 复制成功 = 宿主 copied 态：换勾图标 + 闪绿，1.2s 后回落（真宿主是
 				// copied 标志位驱动，这里等价成定时回落）。
-				// currentTarget 真 DOM 有；假 DOM 事件只有 target（同一节点）→ 兜底。
-				const chip = e?.currentTarget ?? e?.target;
-				if (out?.ok && chip && typeof chip.classList?.add === "function") {
-					chip.classList.add("gr-act-copied");
-					try {
-						chip.textContent = "";
-						chip.append(svgIcon(doc, "copied"));
-					} catch {
-						/* 图标换不上不影响闪绿反馈 */
-					}
-					globalThis.setTimeout(() => {
-						try {
-							chip.classList.remove("gr-act-copied");
-							chip.textContent = "";
-							chip.append(svgIcon(doc, "copy"));
-						} catch {
-							/* 行已重建（元素脱离）—— 无需回落 */
-						}
-					}, 1200);
-				}
+				if (out?.ok) flashCopied(e, "copy");
 			},
 		});
 		copyBtn.append(svgIcon(doc, "copy"));
@@ -902,7 +931,8 @@ export function createNavigator(opts = {}) {
 		const sub = renameText(file) ?? (dirSub && file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : null);
 		if (changed) {
 			main.append(el("div", { class: `gr-name${file.status ? ` ${file.status}` : ""}`, text: name }));
-			if (sub) main.append(el("div", { class: "gr-sub", text: sub }));
+			// R27：副行全文进原生 tooltip（长 rename 被截断时悬停可见完整 old → new）。
+			if (sub) main.append(el("div", { class: "gr-sub", text: sub, title: sub }));
 			row.append(main);
 			row.append(countsSpan(file.add, file.del));
 			const isUntracked = (file.flags ?? []).includes("untracked");
@@ -923,8 +953,9 @@ export function createNavigator(opts = {}) {
 		if (draftCount > 0) {
 			row.append(el("span", { class: "gr-comment-badge", text: `💬${draftCount}`, title: t("nav.commentBadge.title", { n: draftCount }) }));
 		}
-		// R25 悬停快捷动作：变更行与预览行同款（两类行都是文件浏览入口）。
-		row.append(rowActionsEl(file.path));
+		// R25 悬停快捷动作：变更行与预览行同款（两类行都是文件浏览入口；rename 行
+		// 多一枚「复制旧路径」，R27）。
+		row.append(rowActionsEl(file));
 		return row;
 	}
 

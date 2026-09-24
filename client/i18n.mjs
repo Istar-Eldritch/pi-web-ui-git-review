@@ -38,6 +38,8 @@ export const DICT = {
 		"nav.act.refHint": "仅引用路径（AI 按需读取）",
 		"nav.act.attachHint": "附加内容到对话",
 		"nav.act.copyHint": "复制路径",
+		// R27：rename 行的旧路径复制（宿主无此按钮，文案沿用 copyPath 语气）。
+		"nav.act.copyOld": "复制改名前路径",
 
 		"nav.layout.tree": "树",
 		"nav.layout.flat": "平铺",
@@ -170,6 +172,8 @@ export const DICT = {
 		"nav.act.refHint": "Reference path only (AI reads on demand)",
 		"nav.act.attachHint": "Attach content to chat",
 		"nav.act.copyHint": "Copy path",
+		// R27: copy the pre-rename path (no host equivalent; copyPath tone).
+		"nav.act.copyOld": "Copy pre-rename path",
 
 		"nav.layout.tree": "Tree",
 		"nav.layout.flat": "Flat",
