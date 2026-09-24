@@ -357,6 +357,7 @@ export const NAVIGATOR_CSS = `
 .gr-act-copy { color: var(--gr-dim); background: #94a3b824; }
 .gr-act-copy:hover { background: var(--gr-dim); color: var(--bg, #0d0e12); }
 .gr-act-copied { background: var(--gr-green); color: #fff; }
+.gr-act svg { display: block; }
 .gr-act:after {
 	content: attr(data-tip); background: var(--gr-tooltip); color: var(--text, #e6e8ef);
 	border: 1px solid var(--gr-border); white-space: nowrap; pointer-events: none; opacity: 0;
@@ -426,6 +427,56 @@ export const NAVIGATOR_CSS = `
 `;
 
 const styledDocs = new WeakSet();
+
+/* ------------------------------------------------------------------ */
+/* R25a：行动作芯片图标 —— 宿主文件树 file-attach 按钮同款 Feather 图标      */
+/* ------------------------------------------------------------------ */
+
+/** SVG 命名空间与公共属性（与宿主 react-icons GenIcon 渲染结果逐属性一致：
+ *  viewBox/fill/stroke/strokeWidth/strokeLinecap/strokeLinejoin + 1em 尺寸）。 */
+const SVG_NS = "http://www.w3.org/2000/svg";
+const ICON_ATTR = {
+	viewBox: "0 0 24 24",
+	fill: "none",
+	stroke: "currentColor",
+	"stroke-width": "2",
+	"stroke-linecap": "round",
+	"stroke-linejoin": "round",
+	width: "1em",
+	height: "1em",
+};
+
+/** 图标形状表（从宿主 bundle 逐字提取：ref=FiLink, attach=FiPlus,
+ *  copy=FiClipboard, copied=FiCheck —— 复制成功态与宿主同款换勾图标）。 */
+const ICONS = {
+	ref: [
+		{ tag: "path", attr: { d: "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" } },
+		{ tag: "path", attr: { d: "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" } },
+	],
+	attach: [
+		{ tag: "line", attr: { x1: "12", y1: "5", x2: "12", y2: "19" } },
+		{ tag: "line", attr: { x1: "5", y1: "12", x2: "19", y2: "12" } },
+	],
+	copy: [
+		{ tag: "path", attr: { d: "M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" } },
+		{ tag: "rect", attr: { x: "8", y: "2", width: "8", height: "4", rx: "1", ry: "1" } },
+	],
+	copied: [{ tag: "polyline", attr: { points: "20 6 9 17 4 12" } }],
+};
+
+/** 图标 → SVG 元素（createElementNS 优先；缺 NS 支持的环境退 createElement ——
+ *  图标属性全部走 setAttribute，与元素创建方式无关，测试假 DOM 可直接驱动）。 */
+function svgIcon(doc, name) {
+	const make = typeof doc.createElementNS === "function" ? (tag) => doc.createElementNS(SVG_NS, tag) : (tag) => doc.createElement(tag);
+	const svg = make("svg");
+	for (const [k, v] of Object.entries(ICON_ATTR)) svg.setAttribute(k, v);
+	for (const shape of ICONS[name] ?? []) {
+		const node = make(shape.tag);
+		for (const [k, v] of Object.entries(shape.attr)) node.setAttribute(k, v);
+		svg.append(node);
+	}
+	return svg;
+}
 
 /** 把导航样式注入文档 <head>（每个文档一次；失败不影响功能）。 */
 export function ensureStyles(doc) {
@@ -758,10 +809,13 @@ export function createNavigator(opts = {}) {
 	}
 
 	/**
-	 * R25：文件行悬停快捷动作（引 = 引用进草稿 / 附 = 全文内联进草稿 / 复 = 复制
-	 * 绝对路径）。设计复刻宿主文件树的 file-attach 芯片（22×22 彩色软底 + data-tip
-	 * 纯 CSS 气泡 + 悬停实底反转；复制成功闪绿同宿主 copied 态）。stopPropagation ——
-	 * 不触发行选中/打开；桥缺失时动作安静 no-op（宿主里桥恒在，测试可注入桩）。
+	 * R25/R25a：文件行悬停快捷动作（引 = 引用进草稿 / 附 = 全文内联进草稿 /
+	 * 复 = 复制绝对路径）。设计复刻宿主文件树的 file-attach 芯片：22×22 彩色软底 +
+	 * **同款 Feather 图标**（FiLink/FiPlus/FiClipboard，模块级 ICONS 逐字提取）+
+	 * **同款 tooltip 文案**（宿主 referenceTip/attachInlineTip/copyPath 原句，i18n
+	 * nav.act.*）+ data-tip 纯 CSS 气泡 + 悬停实底反转；复制成功换勾图标 + 闪绿
+	 * （宿主 copied 态同款）。stopPropagation —— 不触发行选中/打开；桥缺失时动作
+	 * 安静 no-op（宿主里桥恒在，测试可注入桩）。
 	 */
 	function rowActionsEl(path) {
 		const stop = (e) => {
@@ -772,54 +826,62 @@ export function createNavigator(opts = {}) {
 			}
 		};
 		const wrap = el("span", { class: "gr-acts" });
-		wrap.append(
-			el("button", {
-				type: "button",
-				class: "gr-act gr-act-ref",
-				text: t("nav.act.ref"),
-				"data-tip": t("nav.act.refHint", { path }),
-				"aria-label": t("nav.act.refHint", { path }),
-				onclick: (e) => {
-					stop(e);
-					rowActions.reference(path);
-				},
-			}),
-			el("button", {
-				type: "button",
-				class: "gr-act gr-act-attach",
-				text: t("nav.act.attach"),
-				"data-tip": t("nav.act.attachHint", { path }),
-				"aria-label": t("nav.act.attachHint", { path }),
-				onclick: (e) => {
-					stop(e);
-					rowActions.attach(path, currentBaseRef());
-				},
-			}),
-			el("button", {
-				type: "button",
-				class: "gr-act gr-act-copy",
-				text: t("nav.act.copy"),
-				"data-tip": t("nav.act.copyHint", { path }),
-				"aria-label": t("nav.act.copyHint", { path }),
-				onclick: async (e) => {
-					stop(e);
-					const out = await rowActions.copyPath(path);
-					// 复制成功闪绿（宿主 .file-attach.copy.copied 同款），1.2s 后回落。
-					// currentTarget 真 DOM 有；假 DOM 事件只有 target（同一节点）→ 兜底。
-					const chip = e?.currentTarget ?? e?.target;
-					if (out?.ok && chip && typeof chip.classList?.add === "function") {
-						chip.classList.add("gr-act-copied");
-						globalThis.setTimeout(() => {
-							try {
-								chip.classList.remove("gr-act-copied");
-							} catch {
-								/* 行已重建（元素脱离）—— 无需回落 */
-							}
-						}, 1200);
+		const refBtn = el("button", {
+			type: "button",
+			class: "gr-act gr-act-ref",
+			"data-tip": t("nav.act.refHint"),
+			"aria-label": t("nav.act.refHint"),
+			onclick: (e) => {
+				stop(e);
+				rowActions.reference(path);
+			},
+		});
+		refBtn.append(svgIcon(doc, "ref"));
+		const attachBtn = el("button", {
+			type: "button",
+			class: "gr-act gr-act-attach",
+			"data-tip": t("nav.act.attachHint"),
+			"aria-label": t("nav.act.attachHint"),
+			onclick: (e) => {
+				stop(e);
+				rowActions.attach(path, currentBaseRef());
+			},
+		});
+		attachBtn.append(svgIcon(doc, "attach"));
+		const copyBtn = el("button", {
+			type: "button",
+			class: "gr-act gr-act-copy",
+			"data-tip": t("nav.act.copyHint"),
+			"aria-label": t("nav.act.copyHint"),
+			onclick: async (e) => {
+				stop(e);
+				const out = await rowActions.copyPath(path);
+				// 复制成功 = 宿主 copied 态：换勾图标 + 闪绿，1.2s 后回落（真宿主是
+				// copied 标志位驱动，这里等价成定时回落）。
+				// currentTarget 真 DOM 有；假 DOM 事件只有 target（同一节点）→ 兜底。
+				const chip = e?.currentTarget ?? e?.target;
+				if (out?.ok && chip && typeof chip.classList?.add === "function") {
+					chip.classList.add("gr-act-copied");
+					try {
+						chip.textContent = "";
+						chip.append(svgIcon(doc, "copied"));
+					} catch {
+						/* 图标换不上不影响闪绿反馈 */
 					}
-				},
-			}),
-		);
+					globalThis.setTimeout(() => {
+						try {
+							chip.classList.remove("gr-act-copied");
+							chip.textContent = "";
+							chip.append(svgIcon(doc, "copy"));
+						} catch {
+							/* 行已重建（元素脱离）—— 无需回落 */
+						}
+					}, 1200);
+				}
+			},
+		});
+		copyBtn.append(svgIcon(doc, "copy"));
+		wrap.append(refBtn, attachBtn, copyBtn);
 		return wrap;
 	}
 

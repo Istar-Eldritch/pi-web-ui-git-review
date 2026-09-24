@@ -180,6 +180,12 @@ export class FakeDocument {
 	createElement(tag) {
 		return new FakeElement(tag);
 	}
+
+	/** SVG 命名空间创建（navigator 行动作芯片的 Feather 图标用）；假 DOM 不区分
+	 * 命名空间 —— 与 createElement 同款返回 FakeElement，测试只验结构不验渲染。 */
+	createElementNS(_ns, tag) {
+		return new FakeElement(tag);
+	}
 }
 
 /** 按 className 收集子树节点（顺序 = 构建序）。 */

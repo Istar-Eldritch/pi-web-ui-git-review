@@ -34,12 +34,10 @@ export const DICT = {
 		"nav.base.close": "关闭",
 		"nav.base.markerInfo": "存储的标记：{sha}",
 		"nav.select": "选择在主区查看 diff：{path}",
-		"nav.act.ref": "引",
-		"nav.act.refHint": "把文件以引用方式放进输入框（AI 按需读取）：{path}",
-		"nav.act.attach": "附",
-		"nav.act.attachHint": "把全文附进输入框（超限/二进制/截断自动改为引用）：{path}",
-		"nav.act.copy": "复",
-		"nav.act.copyHint": "复制绝对路径：{path}",
+		// R25a：tooltip 与宿主文件树原句原样（referenceTip/attachInlineTip/copyPath）。
+		"nav.act.refHint": "仅引用路径（AI 按需读取）",
+		"nav.act.attachHint": "附加内容到对话",
+		"nav.act.copyHint": "复制路径",
 
 		"nav.layout.tree": "树",
 		"nav.layout.flat": "平铺",
@@ -168,12 +166,10 @@ export const DICT = {
 		"nav.base.close": "Close",
 		"nav.base.markerInfo": "Stored marker: {sha}",
 		"nav.select": "Select to view the diff in the main area: {path}",
-		"nav.act.ref": "@",
-		"nav.act.refHint": "Reference this file into the composer (AI reads it on demand): {path}",
-		"nav.act.attach": "+",
-		"nav.act.attachHint": "Attach the full text to the composer (falls back to a reference when too big/binary/truncated): {path}",
-		"nav.act.copy": "⧉",
-		"nav.act.copyHint": "Copy the absolute path: {path}",
+		// R25a: tooltips verbatim from the host file tree (referenceTip/attachInlineTip/copyPath).
+		"nav.act.refHint": "Reference path only (AI reads on demand)",
+		"nav.act.attachHint": "Attach content to chat",
+		"nav.act.copyHint": "Copy path",
 
 		"nav.layout.tree": "Tree",
 		"nav.layout.flat": "Flat",

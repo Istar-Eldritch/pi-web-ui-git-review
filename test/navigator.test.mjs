@@ -999,14 +999,34 @@ function blobRoute(lines, extra = {}) {
 }
 
 describe("navigator row quick actions (R25)", () => {
-	it("file rows carry a hover action cluster (引/附/复) in both changed and preview styles", async () => {
+	const actByClass = (row, cls) => collect(row.el, cls)[0] ?? null;
+	const svgShapes = (button) =>
+		(button?.childNodes ?? []).filter((n) => typeof n !== "string" && String(n.tagName).toLowerCase() === "svg");
+
+	it("file rows carry host-style icon chips in both changed and preview styles (R25a)", async () => {
 		resetStore();
 		const { view } = await mountNavigator(standardRoutes());
 		const changed = rowsOf(view.root).find((row) => row.path === "keep.txt");
-		const acts = collect(changed.el, "gr-act");
-		assert.deepEqual(acts.map((button) => button.textContent), ["引", "附", "复"]);
-		assert.ok(acts.every((button) => String(button.getAttribute("data-tip")).includes("keep.txt")), "data-tip tooltips carry the file path");
-		assert.ok(acts.every((button) => button.getAttribute("aria-label")?.includes("keep.txt")), "aria-labels mirror the tooltips");
+		// 三个芯片 = 宿主三按钮同款（ref/inline/copy）；每个芯片一个 1em Feather svg
+		const ref = actByClass(changed, "gr-act-ref");
+		const attach = actByClass(changed, "gr-act-attach");
+		const copy = actByClass(changed, "gr-act-copy");
+		assert.ok(ref && attach && copy, "three action chips present");
+		for (const [button, shapes] of [[ref, 2], [attach, 2], [copy, 2]]) {
+			const svgs = svgShapes(button);
+			assert.equal(svgs.length, 1, "one svg icon per chip");
+			assert.equal(svgs[0].getAttribute("width"), "1em");
+			assert.equal(svgs[0].getAttribute("viewBox"), "0 0 24 24");
+			assert.equal(svgs[0].childNodes.length, shapes, "icon shape count (FiLink/FiPlus/FiClipboard)");
+		}
+		// tooltip = 宿主文件树原句（referenceTip/attachInlineTip/copyPath），aria 同文
+		assert.equal(ref.getAttribute("data-tip"), "仅引用路径（AI 按需读取）");
+		assert.equal(attach.getAttribute("data-tip"), "附加内容到对话");
+		assert.equal(copy.getAttribute("data-tip"), "复制路径");
+		assert.ok(
+			[ref, attach, copy].every((button) => button.getAttribute("aria-label") === button.getAttribute("data-tip")),
+			"aria-labels mirror the tooltips",
+		);
 		// 计数列与动作簇同行存在（悬停时 CSS 互换显隐 —— 假 DOM 无悬停，验节点共存）
 		assert.ok(collect(changed.el, "gr-counts").length === 1, "counts column coexists (hidden on hover via CSS only)");
 		assert.ok(changed.el.classList.contains("gr-row"));
@@ -1015,7 +1035,7 @@ describe("navigator row quick actions (R25)", () => {
 		collect(view.root, "gr-segbtn").find((button) => button.textContent === "全树").click();
 		await assertEventually(() => rowsOf(view.root).some((row) => row.path === "readme.md"), "full tree must render");
 		const preview = rowsOf(view.root).find((row) => row.path === "readme.md");
-		assert.deepEqual(collect(preview.el, "gr-act").map((button) => button.textContent), ["引", "附", "复"]);
+		assert.ok(actByClass(preview, "gr-act-ref") && actByClass(preview, "gr-act-attach") && actByClass(preview, "gr-act-copy"));
 		view.destroy();
 	});
 
@@ -1025,7 +1045,7 @@ describe("navigator row quick actions (R25)", () => {
 		const { view } = await mountNavigator(standardRoutes(), { getBridge: () => spy.host });
 		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
 		const stopCalls = [];
-		collect(row.el, "gr-act").find((button) => button.textContent === "引").click({ stopPropagation: () => stopCalls.push(1) });
+		actByClass(row, "gr-act-ref").click({ stopPropagation: () => stopCalls.push(1) });
 		await assertEventually(() => spy.composed.length === 1, "compose must fire");
 		assert.deepEqual(spy.composed, [{ attachments: [{ path: "/repo/keep.txt", name: "keep.txt", mode: "reference" }] }]);
 		assert.equal(stopCalls.length, 1, "stopPropagation must be invoked (real DOM: no row select)");
@@ -1038,7 +1058,7 @@ describe("navigator row quick actions (R25)", () => {
 		const spy = composeSpy();
 		const { view, server } = await mountNavigator(standardRoutes({ "/blob": blobRoute(["const a = 1;"]) }), { getBridge: () => spy.host });
 		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
-		collect(row.el, "gr-act").find((button) => button.textContent === "附").click();
+		actByClass(row, "gr-act-attach").click();
 		await assertEventually(() => spy.composed.length === 1, "compose must fire");
 		const blobCall = server.calls.find((call) => call.route === "/blob");
 		assert.ok(blobCall, "/blob must be queried");
@@ -1051,7 +1071,7 @@ describe("navigator row quick actions (R25)", () => {
 		const spy2 = composeSpy();
 		const { view: view2 } = await mountNavigator(standardRoutes({ "/blob": blobRoute(["a"], { truncated: true }) }), { getBridge: () => spy2.host });
 		const row2 = rowsOf(view2.root).find((row) => row.path === "keep.txt");
-		collect(row2.el, "gr-act").find((button) => button.textContent === "附").click();
+		actByClass(row2, "gr-act-attach").click();
 		await assertEventually(() => spy2.composed.length === 1, "fallback compose must fire");
 		assert.deepEqual(spy2.composed[0].attachments[0].mode, "reference");
 		view2.destroy();
@@ -1065,7 +1085,7 @@ describe("navigator row quick actions (R25)", () => {
 			clipboard: { writeText: async (text) => (writes.push(text), true) },
 		});
 		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
-		const copyBtn = collect(row.el, "gr-act").find((button) => button.textContent === "复");
+		const copyBtn = actByClass(row, "gr-act-copy");
 		copyBtn.click();
 		await assertEventually(() => writes.length === 1, "clipboard write must fire");
 		assert.deepEqual(writes, ["/repo/keep.txt"]);
@@ -1077,8 +1097,8 @@ describe("navigator row quick actions (R25)", () => {
 		resetStore();
 		const { view } = await mountNavigator(standardRoutes());
 		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
-		assert.doesNotThrow(() => collect(row.el, "gr-act").find((button) => button.textContent === "引").click());
-		assert.doesNotThrow(() => collect(row.el, "gr-act").find((button) => button.textContent === "附").click());
+		assert.doesNotThrow(() => actByClass(row, "gr-act-ref").click());
+		assert.doesNotThrow(() => actByClass(row, "gr-act-attach").click());
 		view.destroy();
 	});
 });
