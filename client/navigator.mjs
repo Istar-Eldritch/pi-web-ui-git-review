@@ -269,6 +269,8 @@ export const NAVIGATOR_CSS = `
 	--gr-green: var(--green, #34d399);
 	--gr-red: var(--red, #f87171);
 	--gr-amber: var(--amber, #fbbf24);
+	--gr-on-amber: var(--on-amber, #1a1a1a);
+	--gr-tooltip: var(--tooltip-bg, #232733);
 	--gr-hover: var(--bg-elev2, #1a1d26);
 	--gr-soft: var(--accent-soft, rgba(139, 92, 246, 0.14));
 	color: var(--text, #e6e8ef);
@@ -336,16 +338,38 @@ export const NAVIGATOR_CSS = `
 .gr-del { color: var(--gr-red); }
 .gr-flag { flex: none; font-size: 10px; padding: 0 5px; border-radius: 7px; border: 1px solid var(--gr-border); color: var(--gr-dim); white-space: nowrap; }
 .gr-flag.untracked { color: var(--gr-amber); border-color: currentColor; }
-/* R25：文件行悬停快捷动作（引/附/复）—— 默认隐藏不占位，悬停/键盘聚焦浮现；
-   与行尾计数列/徽标共存，baseline 对齐下用 align-self 居中。 */
+/* R25：文件行悬停快捷动作（引/附/复）—— 复刻宿主文件树 file-attach 芯片设计：
+   22×22 无边框彩色软底、悬停实底反转、data-tip 纯 CSS 气泡（:after 气泡 + :before
+   箭头，右上对齐），悬停/键盘聚焦浮现；悬停行时隐藏 +/− 计数列给动作让位
+   （只对文件行 —— 目录行 .gr-dirrow 的聚合计数保留）。复制成功闪绿同宿主。 */
 .gr-acts { flex: none; display: none; gap: 2px; align-self: center; }
 .gr-row:hover .gr-acts, .gr-row:focus-within .gr-acts { display: inline-flex; }
+.gr-row:hover .gr-counts, .gr-row:focus-within .gr-counts { display: none; }
 .gr-act {
-	font: inherit; font-size: 10px; line-height: 1; cursor: pointer;
-	color: var(--gr-dim); background: transparent; border: 1px solid var(--gr-border);
-	border-radius: 4px; padding: 2px 4px; white-space: nowrap;
+	position: relative; display: inline-flex; justify-content: center; align-items: center;
+	width: 22px; height: 22px; flex: none; cursor: pointer;
+	font: inherit; font-size: 12px; line-height: 1; border: none; border-radius: 5px; padding: 0;
 }
-.gr-act:hover { color: var(--text, #e6e8ef); background: var(--gr-hover); border-color: var(--gr-accent); }
+.gr-act-ref { color: var(--gr-amber); background: #fbbf241f; }
+.gr-act-ref:hover { background: var(--gr-amber); color: var(--gr-on-amber); }
+.gr-act-attach { color: var(--gr-accent); background: var(--gr-soft); }
+.gr-act-attach:hover { background: var(--gr-accent); color: #fff; }
+.gr-act-copy { color: var(--gr-dim); background: #94a3b824; }
+.gr-act-copy:hover { background: var(--gr-dim); color: var(--bg, #0d0e12); }
+.gr-act-copied { background: var(--gr-green); color: #fff; }
+.gr-act:after {
+	content: attr(data-tip); background: var(--gr-tooltip); color: var(--text, #e6e8ef);
+	border: 1px solid var(--gr-border); white-space: nowrap; pointer-events: none; opacity: 0;
+	z-index: 40; border-radius: 6px; padding: 4px 9px; font-size: 11px; line-height: 1.4;
+	transition: opacity 90ms; position: absolute; bottom: calc(100% + 8px); right: 0;
+	box-shadow: 0 4px 14px #00000073;
+}
+.gr-act:before {
+	content: ""; border: 5px solid #0000; border-top-color: var(--gr-tooltip);
+	pointer-events: none; opacity: 0; z-index: 40; transition: opacity 90ms;
+	position: absolute; bottom: calc(100% + 3px); right: 6px;
+}
+.gr-act:hover:after, .gr-act:hover:before { opacity: 1; }
 .gr-dirrow { display: flex; align-items: center; gap: 5px; padding: 3px 8px; cursor: pointer; color: var(--gr-dim); font-size: 12px; }
 /* R19：目录级聚合计数 —— 右缘对齐文件行的计数列（复用 gr-counts/gr-add/gr-del）。 */
 .gr-dirrow .gr-counts { font-size: 10.5px; }
@@ -735,8 +759,9 @@ export function createNavigator(opts = {}) {
 
 	/**
 	 * R25：文件行悬停快捷动作（引 = 引用进草稿 / 附 = 全文内联进草稿 / 复 = 复制
-	 * 绝对路径）。stopPropagation —— 不触发行的选中/打开；桥缺失时动作安静 no-op
-	 * （宿主里桥恒在，测试可注入桩）。悬停显隐纯 CSS（.gr-row:hover .gr-acts）。
+	 * 绝对路径）。设计复刻宿主文件树的 file-attach 芯片（22×22 彩色软底 + data-tip
+	 * 纯 CSS 气泡 + 悬停实底反转；复制成功闪绿同宿主 copied 态）。stopPropagation ——
+	 * 不触发行选中/打开；桥缺失时动作安静 no-op（宿主里桥恒在，测试可注入桩）。
 	 */
 	function rowActionsEl(path) {
 		const stop = (e) => {
@@ -749,30 +774,49 @@ export function createNavigator(opts = {}) {
 		const wrap = el("span", { class: "gr-acts" });
 		wrap.append(
 			el("button", {
-				class: "gr-act",
+				type: "button",
+				class: "gr-act gr-act-ref",
 				text: t("nav.act.ref"),
-				title: t("nav.act.refHint", { path }),
+				"data-tip": t("nav.act.refHint", { path }),
+				"aria-label": t("nav.act.refHint", { path }),
 				onclick: (e) => {
 					stop(e);
 					rowActions.reference(path);
 				},
 			}),
 			el("button", {
-				class: "gr-act",
+				type: "button",
+				class: "gr-act gr-act-attach",
 				text: t("nav.act.attach"),
-				title: t("nav.act.attachHint", { path }),
+				"data-tip": t("nav.act.attachHint", { path }),
+				"aria-label": t("nav.act.attachHint", { path }),
 				onclick: (e) => {
 					stop(e);
 					rowActions.attach(path, currentBaseRef());
 				},
 			}),
 			el("button", {
-				class: "gr-act",
+				type: "button",
+				class: "gr-act gr-act-copy",
 				text: t("nav.act.copy"),
-				title: t("nav.act.copyHint", { path }),
-				onclick: (e) => {
+				"data-tip": t("nav.act.copyHint", { path }),
+				"aria-label": t("nav.act.copyHint", { path }),
+				onclick: async (e) => {
 					stop(e);
-					rowActions.copyPath(path);
+					const out = await rowActions.copyPath(path);
+					// 复制成功闪绿（宿主 .file-attach.copy.copied 同款），1.2s 后回落。
+					// currentTarget 真 DOM 有；假 DOM 事件只有 target（同一节点）→ 兜底。
+					const chip = e?.currentTarget ?? e?.target;
+					if (out?.ok && chip && typeof chip.classList?.add === "function") {
+						chip.classList.add("gr-act-copied");
+						globalThis.setTimeout(() => {
+							try {
+								chip.classList.remove("gr-act-copied");
+							} catch {
+								/* 行已重建（元素脱离）—— 无需回落 */
+							}
+						}, 1200);
+					}
 				},
 			}),
 		);

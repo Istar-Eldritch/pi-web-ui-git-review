@@ -1005,7 +1005,11 @@ describe("navigator row quick actions (R25)", () => {
 		const changed = rowsOf(view.root).find((row) => row.path === "keep.txt");
 		const acts = collect(changed.el, "gr-act");
 		assert.deepEqual(acts.map((button) => button.textContent), ["引", "附", "复"]);
-		assert.ok(acts.every((button) => String(button.getAttribute("title")).includes("keep.txt")), "tooltips carry the file path");
+		assert.ok(acts.every((button) => String(button.getAttribute("data-tip")).includes("keep.txt")), "data-tip tooltips carry the file path");
+		assert.ok(acts.every((button) => button.getAttribute("aria-label")?.includes("keep.txt")), "aria-labels mirror the tooltips");
+		// 计数列与动作簇同行存在（悬停时 CSS 互换显隐 —— 假 DOM 无悬停，验节点共存）
+		assert.ok(collect(changed.el, "gr-counts").length === 1, "counts column coexists (hidden on hover via CSS only)");
+		assert.ok(changed.el.classList.contains("gr-row"));
 
 		// 全树预览行同款（两类行都是文件浏览入口）
 		collect(view.root, "gr-segbtn").find((button) => button.textContent === "全树").click();
@@ -1054,16 +1058,18 @@ describe("navigator row quick actions (R25)", () => {
 		view.destroy();
 	});
 
-	it("复制 copies the absolute path through the injected clipboard", async () => {
+	it("复制 copies the absolute path through the injected clipboard and flashes green (copied)", async () => {
 		resetStore();
 		const writes = [];
 		const { view } = await mountNavigator(standardRoutes(), {
 			clipboard: { writeText: async (text) => (writes.push(text), true) },
 		});
 		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
-		collect(row.el, "gr-act").find((button) => button.textContent === "复").click();
+		const copyBtn = collect(row.el, "gr-act").find((button) => button.textContent === "复");
+		copyBtn.click();
 		await assertEventually(() => writes.length === 1, "clipboard write must fire");
 		assert.deepEqual(writes, ["/repo/keep.txt"]);
+		await assertEventually(() => copyBtn.classList.contains("gr-act-copied"), "copied flash must land on the chip");
 		view.destroy();
 	});
 
