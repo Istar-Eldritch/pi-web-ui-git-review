@@ -10,6 +10,7 @@
 	await import("./gitcore.test.mjs");
 	await import("./server-smoke.test.mjs");
 	await import("./tree-route.test.mjs");
+	await import("./actions.test.mjs");
 	await import("./navigator.test.mjs");
 	await import("./viewer.test.mjs");
 	await import("./markdown.test.mjs");

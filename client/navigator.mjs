@@ -39,7 +39,15 @@
  * R24a：输入只重建清单主体（renderBodyOnly），输入框元素原地保留 —— 焦点/光标/
  * IME 组合态天然不受影响；焦点恢复放在元素挂载之后（detached 上 focus() 是
  * no-op，首版每键失焦的根因，假 DOM 无焦点语义测不出来）。
+ *
+ * R25：文件行悬停快捷动作（引/附/复）—— 本 tab 升格为唯一文件浏览器的宿主
+ * 文件树 parity：引用 = reference 附件进草稿（宿主「仅引用路径」同款形态），
+ * 附加 = /blob?side=new 全文内联进草稿（超限/二进制/截断自动降级引用），复制
+ * 路径 = 绝对路径进剪贴板。通道全是宿主桥受支持的 compose({text,attachments})
+ * 契约（只填草稿绝不发送）；仓库根取自 refresh 已有的 GET /marker 响应。动作
+ * 点击 stopPropagation —— 不触发行的选中/打开。逻辑与流程在 actions.mjs。
  */
+import { createRowActions } from "./actions.mjs";
 import { DEFAULT_BASE_CANDIDATES } from "./gitcore.mjs";
 import { detectLang, localeToLang, makeT, watchLocale } from "./i18n.mjs";
 import { createReviewSubmitter } from "./submit.mjs";
@@ -328,6 +336,16 @@ export const NAVIGATOR_CSS = `
 .gr-del { color: var(--gr-red); }
 .gr-flag { flex: none; font-size: 10px; padding: 0 5px; border-radius: 7px; border: 1px solid var(--gr-border); color: var(--gr-dim); white-space: nowrap; }
 .gr-flag.untracked { color: var(--gr-amber); border-color: currentColor; }
+/* R25：文件行悬停快捷动作（引/附/复）—— 默认隐藏不占位，悬停/键盘聚焦浮现；
+   与行尾计数列/徽标共存，baseline 对齐下用 align-self 居中。 */
+.gr-acts { flex: none; display: none; gap: 2px; align-self: center; }
+.gr-row:hover .gr-acts, .gr-row:focus-within .gr-acts { display: inline-flex; }
+.gr-act {
+	font: inherit; font-size: 10px; line-height: 1; cursor: pointer;
+	color: var(--gr-dim); background: transparent; border: 1px solid var(--gr-border);
+	border-radius: 4px; padding: 2px 4px; white-space: nowrap;
+}
+.gr-act:hover { color: var(--text, #e6e8ef); background: var(--gr-hover); border-color: var(--gr-accent); }
 .gr-dirrow { display: flex; align-items: center; gap: 5px; padding: 3px 8px; cursor: pointer; color: var(--gr-dim); font-size: 12px; }
 /* R19：目录级聚合计数 —— 右缘对齐文件行的计数列（复用 gr-counts/gr-add/gr-del）。 */
 .gr-dirrow .gr-counts { font-size: 10.5px; }
@@ -456,6 +474,15 @@ export function createNavigator(opts = {}) {
 	let uiNotice = null; // Phase 4 可见通知 { kind, text, copyable?, copyText?, messageText? }（只被新通知替换，卸载随之消失）
 	let submitting = false;
 	let submitter = null; // 兜底构建的提交流（opts.submitter 已注入时直接用）
+	let repoRoot = ""; // R25：仓库根绝对路径（refresh 的 GET /marker 响应带出）
+	// R25 行级动作流：apiBase/fetch 与视图同一套；桥/剪贴板可注入（测试桩）。
+	const rowActions = createRowActions({
+		apiBase: api,
+		fetchImpl: doFetch,
+		getRepoRoot: () => repoRoot,
+		getBridge: opts.getBridge,
+		clipboard: opts.clipboard,
+	});
 
 	const modes = () => store.getState().viewModes;
 
@@ -690,15 +717,66 @@ export function createNavigator(opts = {}) {
 		}
 	}
 
+	/** 当前评审基线 ref（覆盖优先；无则 /review 解析结果；再无则 null = 服务端自解析）。 */
+	function currentBaseRef() {
+		const override = store.getState().baseOverride;
+		return override?.ref ?? review?.base?.ref ?? null;
+	}
+
 	/** 选中并打开（R7/R17/R18 共用入口）：{path, base} 原子写入共享 store（viewer
 	 *  对任一变化重拉 /diff，范围外时链式取 /blob 预览），展示内嵌优先（R17）——
 	 *  entry 注入 openFile（inline 控制器装进聊天主区消息面板位置，锚不到时它自己
 	 *  回落全屏）；未注入（测试/兜底）→ 旧的 setView 全屏切换（桥不可用时安静降级）。 */
 	function selectAndOpen(path) {
-		const override = store.getState().baseOverride;
-		store.setSelection({ path, base: override?.ref ?? review?.base?.ref ?? null });
+		store.setSelection({ path, base: currentBaseRef() });
 		if (typeof opts.openFile === "function") opts.openFile();
 		else activateMainView();
+	}
+
+	/**
+	 * R25：文件行悬停快捷动作（引 = 引用进草稿 / 附 = 全文内联进草稿 / 复 = 复制
+	 * 绝对路径）。stopPropagation —— 不触发行的选中/打开；桥缺失时动作安静 no-op
+	 * （宿主里桥恒在，测试可注入桩）。悬停显隐纯 CSS（.gr-row:hover .gr-acts）。
+	 */
+	function rowActionsEl(path) {
+		const stop = (e) => {
+			try {
+				e?.stopPropagation?.();
+			} catch {
+				/* 事件对象不完整时忽略 —— 动作仍要执行 */
+			}
+		};
+		const wrap = el("span", { class: "gr-acts" });
+		wrap.append(
+			el("button", {
+				class: "gr-act",
+				text: t("nav.act.ref"),
+				title: t("nav.act.refHint", { path }),
+				onclick: (e) => {
+					stop(e);
+					rowActions.reference(path);
+				},
+			}),
+			el("button", {
+				class: "gr-act",
+				text: t("nav.act.attach"),
+				title: t("nav.act.attachHint", { path }),
+				onclick: (e) => {
+					stop(e);
+					rowActions.attach(path, currentBaseRef());
+				},
+			}),
+			el("button", {
+				class: "gr-act",
+				text: t("nav.act.copy"),
+				title: t("nav.act.copyHint", { path }),
+				onclick: (e) => {
+					stop(e);
+					rowActions.copyPath(path);
+				},
+			}),
+		);
+		return wrap;
 	}
 
 	/** 文件行（Phase 1 /review 行契约：status 字母、add/del、rename old→new、flags；
@@ -737,6 +815,8 @@ export function createNavigator(opts = {}) {
 		if (draftCount > 0) {
 			row.append(el("span", { class: "gr-comment-badge", text: `💬${draftCount}`, title: t("nav.commentBadge.title", { n: draftCount }) }));
 		}
+		// R25 悬停快捷动作：变更行与预览行同款（两类行都是文件浏览入口）。
+		row.append(rowActionsEl(file.path));
 		return row;
 	}
 
@@ -1112,6 +1192,9 @@ export function createNavigator(opts = {}) {
 			]);
 			if (my !== seq) return;
 			markerSha = markerRes?.ok && markerRes.sha ? markerRes.sha : null;
+			// R25：仓库根绝对路径随同一次 /marker 响应带出（服务端恒返 repoRoot，
+			// 与 marker 是否存在无关）；行级快捷动作的引用/复制用它拼绝对路径。
+			repoRoot = typeof markerRes?.repoRoot === "string" ? markerRes.repoRoot : "";
 			refs = Array.isArray(refsRes?.refs) ? refsRes.refs : [];
 			commits = Array.isArray(commitsRes?.commits) ? commitsRes.commits : [];
 

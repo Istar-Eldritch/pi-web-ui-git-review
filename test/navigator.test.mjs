@@ -150,7 +150,7 @@ function resetStore() {
 	localStorageBag.clear();
 }
 
-async function mountNavigator(routes, { lang = "zh", ctx, openFile } = {}) {
+async function mountNavigator(routes, { lang = "zh", ctx, openFile, getBridge, clipboard } = {}) {
 	const server = createStubServer(routes);
 	const view = navModule.createNavigator({
 		document: new FakeDocument(),
@@ -159,6 +159,8 @@ async function mountNavigator(routes, { lang = "zh", ctx, openFile } = {}) {
 		lang,
 		ctx,
 		openFile,
+		getBridge,
+		clipboard,
 	});
 	await view.refresh();
 	return { view, server };
@@ -961,5 +963,116 @@ describe("navigator locale and lifecycle", () => {
 		);
 		view.destroy();
 		assert.doesNotThrow(() => deliver({ kind: "cwd-changed" })); // 销毁后的迟到广播不复活视图
+	});
+});
+
+/* ------------------------------------------------------------------ */
+/* R25：文件行悬停快捷动作（引/附/复）—— 唯一文件浏览器的宿主文件树 parity   */
+/* ------------------------------------------------------------------ */
+
+/** compose 桥桩（宿主 compose({text,attachments}) 契约；记录 payload）。 */
+function composeSpy({ result = true } = {}) {
+	const composed = [];
+	return {
+		host: {
+			compose(payload) {
+				composed.push(payload);
+				return result;
+			},
+		},
+		composed,
+	};
+}
+
+/** 全文 /blob 载荷（side=new，服务端 previewHunks 单 hunk 形态）。 */
+function blobRoute(lines, extra = {}) {
+	return () => ({
+		ok: true,
+		path: "keep.txt",
+		preview: true,
+		side: "new",
+		binary: false,
+		truncated: false,
+		hunks: [{ oldStart: 1, oldLines: lines.length, newStart: 1, newLines: lines.length, lines: lines.map((text, i) => ({ type: "ctx", old: i + 1, new: i + 1, text })) }],
+		...extra,
+	});
+}
+
+describe("navigator row quick actions (R25)", () => {
+	it("file rows carry a hover action cluster (引/附/复) in both changed and preview styles", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		const changed = rowsOf(view.root).find((row) => row.path === "keep.txt");
+		const acts = collect(changed.el, "gr-act");
+		assert.deepEqual(acts.map((button) => button.textContent), ["引", "附", "复"]);
+		assert.ok(acts.every((button) => String(button.getAttribute("title")).includes("keep.txt")), "tooltips carry the file path");
+
+		// 全树预览行同款（两类行都是文件浏览入口）
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "全树").click();
+		await assertEventually(() => rowsOf(view.root).some((row) => row.path === "readme.md"), "full tree must render");
+		const preview = rowsOf(view.root).find((row) => row.path === "readme.md");
+		assert.deepEqual(collect(preview.el, "gr-act").map((button) => button.textContent), ["引", "附", "复"]);
+		view.destroy();
+	});
+
+	it("引用 composes a reference attachment with the absolute path, without selecting the row", async () => {
+		resetStore();
+		const spy = composeSpy();
+		const { view } = await mountNavigator(standardRoutes(), { getBridge: () => spy.host });
+		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
+		const stopCalls = [];
+		collect(row.el, "gr-act").find((button) => button.textContent === "引").click({ stopPropagation: () => stopCalls.push(1) });
+		await assertEventually(() => spy.composed.length === 1, "compose must fire");
+		assert.deepEqual(spy.composed, [{ attachments: [{ path: "/repo/keep.txt", name: "keep.txt", mode: "reference" }] }]);
+		assert.equal(stopCalls.length, 1, "stopPropagation must be invoked (real DOM: no row select)");
+		assert.equal(store.getState().selectedPath, null, "action click must not select the row");
+		view.destroy();
+	});
+
+	it("附加 fetches /blob?side=new and composes inline fileData; truncated payloads fall back to a reference", async () => {
+		resetStore();
+		const spy = composeSpy();
+		const { view, server } = await mountNavigator(standardRoutes({ "/blob": blobRoute(["const a = 1;"]) }), { getBridge: () => spy.host });
+		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
+		collect(row.el, "gr-act").find((button) => button.textContent === "附").click();
+		await assertEventually(() => spy.composed.length === 1, "compose must fire");
+		const blobCall = server.calls.find((call) => call.route === "/blob");
+		assert.ok(blobCall, "/blob must be queried");
+		assert.equal(blobCall.query.side, "new");
+		assert.equal(blobCall.query.path, "keep.txt");
+		assert.equal(blobCall.query.base, "main"); // 与行打开同源的评审基线
+		assert.deepEqual(spy.composed[0], { attachments: [{ path: "", fileData: "const a = 1;", name: "keep.txt", size: new TextEncoder().encode("const a = 1;").length }] });
+
+		// truncated → 降级引用（半截文本比没有更糟）
+		const spy2 = composeSpy();
+		const { view: view2 } = await mountNavigator(standardRoutes({ "/blob": blobRoute(["a"], { truncated: true }) }), { getBridge: () => spy2.host });
+		const row2 = rowsOf(view2.root).find((row) => row.path === "keep.txt");
+		collect(row2.el, "gr-act").find((button) => button.textContent === "附").click();
+		await assertEventually(() => spy2.composed.length === 1, "fallback compose must fire");
+		assert.deepEqual(spy2.composed[0].attachments[0].mode, "reference");
+		view2.destroy();
+		view.destroy();
+	});
+
+	it("复制 copies the absolute path through the injected clipboard", async () => {
+		resetStore();
+		const writes = [];
+		const { view } = await mountNavigator(standardRoutes(), {
+			clipboard: { writeText: async (text) => (writes.push(text), true) },
+		});
+		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
+		collect(row.el, "gr-act").find((button) => button.textContent === "复").click();
+		await assertEventually(() => writes.length === 1, "clipboard write must fire");
+		assert.deepEqual(writes, ["/repo/keep.txt"]);
+		view.destroy();
+	});
+
+	it("no bridge injected → actions click safely without composing (quiet no-op)", async () => {
+		resetStore();
+		const { view } = await mountNavigator(standardRoutes());
+		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
+		assert.doesNotThrow(() => collect(row.el, "gr-act").find((button) => button.textContent === "引").click());
+		assert.doesNotThrow(() => collect(row.el, "gr-act").find((button) => button.textContent === "附").click());
+		view.destroy();
 	});
 });
