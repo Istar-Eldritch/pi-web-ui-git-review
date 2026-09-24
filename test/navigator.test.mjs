@@ -37,7 +37,8 @@ function rowsOf(root) {
 }
 
 function statusOf(row) {
-	return collect(row?.el ?? row, "gr-st")[0]?.textContent ?? null;
+	const name = collect(row?.el ?? row, "gr-name")[0];
+	return ["A", "D", "M", "T", "R", "C"].find((s) => name?.classList?.contains(s)) ?? null;
 }
 
 function flagsOf(row) {
@@ -311,6 +312,14 @@ describe("navigator file rows (phase-1 row contract)", () => {
 		assert.ok(renamed.text.includes("dir/old.txt → dir/new.txt"));
 		assert.ok(renamed.text.includes("+1"));
 
+		// R26：平铺清单 = 所在目录副行的唯一展示处
+		const nestedFlat = rows.find((row) => row.path === "keep.txt");
+		assert.equal(collect(nestedFlat.el, "gr-sub").length, 0, "root-level file has no dirname sub even in flat list");
+		const nestedDirFlat = rows.find((row) => row.path === "dir/new.txt");
+		assert.equal(collect(nestedDirFlat.el, "gr-sub").filter((n) => n.textContent === "dir").length, 0, "rename sub wins over dirname in flat list");
+		const flatWithDir = rows.find((row) => row.path === "untracked.txt");
+		assert.ok(flatWithDir, "flat rows present");
+
 		const staged = rows.find((row) => row.path === "keep.txt");
 		assert.equal(statusOf(staged), "M");
 		assert.deepEqual(flagsOf(staged), ["已暂存"]);
@@ -401,7 +410,7 @@ describe("navigator toggles (tree/flat and changed/full)", () => {
 		const rows = rowsOf(view.root);
 		assert.ok(rows.some((row) => row.path === "readme.md"));
 		const changed = rows.find((row) => row.path === "keep.txt");
-		assert.equal(statusOf(changed), "M"); // 变更徽章（状态字母）
+		assert.equal(statusOf(changed), "M"); // 状态着色（文件名上的状态类）
 		const unchanged = rows.find((row) => row.path === "readme.md");
 		assert.equal(statusOf(unchanged), null);
 		assert.ok(unchanged.el.classList.contains("preview"), "unchanged rows render in preview style");
@@ -1099,6 +1108,61 @@ describe("navigator row quick actions (R25)", () => {
 		const row = rowsOf(view.root).find((row) => row.path === "keep.txt");
 		assert.doesNotThrow(() => actByClass(row, "gr-act-ref").click());
 		assert.doesNotThrow(() => actByClass(row, "gr-act-attach").click());
+		view.destroy();
+	});
+});
+
+describe("dirname sub line placement (R26)", () => {
+	/** 标准评审 + 一个非 rename 的嵌套文件（dirname 副行的真实展示载体）；/tree
+	 *  同步带上（全树模式的数据源是 /tree，不是 /review）。 */
+	function nestedRoutes() {
+		return standardRoutes({
+			"/review": {
+				ok: true,
+				base: { ref: "main", sha: SHA_BASE, source: "marker" },
+				head: { sha: SHA_HEAD },
+				files: [...REVIEW_FILES, { path: "src/lib/util.mjs", status: "M", add: 1, del: 0, flags: [] }],
+				total: REVIEW_FILES.length + 1,
+				truncated: false,
+			},
+			"/tree": {
+				ok: true,
+				files: [...TREE_PAYLOAD.files, "src/lib/util.mjs"],
+				total: TREE_PAYLOAD.total + 1,
+				truncated: false,
+			},
+		});
+	}
+
+	it("flat list shows the dirname sub; tree and full-tree do not; rename sub survives everywhere", async () => {
+		resetStore();
+		const { view } = await mountNavigator(nestedRoutes());
+
+		// 平铺：util.mjs 文件名下有 src/lib 副行
+		const flatNested = rowsOf(view.root).find((row) => row.path === "src/lib/util.mjs");
+		assert.ok(flatNested, "nested flat row renders");
+		assert.deepEqual(collect(flatNested.el, "gr-sub").map((n) => n.textContent), ["src/lib"]);
+
+		// 切树形：副行消失（目录结构已表达）；rename 副行保留
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "树").click();
+		const treeNested = rowsOf(view.root).find((row) => row.path === "src/lib/util.mjs");
+		assert.ok(treeNested, "nested tree row renders");
+		assert.equal(collect(treeNested.el, "gr-sub").length, 0, "tree rows carry no dirname sub");
+		const treeRenamed = rowsOf(view.root).find((row) => row.path === "dir/new.txt");
+		assert.ok(treeRenamed.text.includes("dir/old.txt → dir/new.txt"), "rename sub survives in tree");
+
+		// 切全树：同样没有副行
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "全树").click();
+		await assertEventually(() => rowsOf(view.root).some((row) => row.path === "src/lib/util.mjs"), "full tree must render");
+		const fullNested = rowsOf(view.root).find((row) => row.path === "src/lib/util.mjs");
+		assert.equal(collect(fullNested.el, "gr-sub").length, 0, "full-tree rows carry no dirname sub");
+
+		// 回到平铺（仍全树 scope？不 —— 全树是 scope；先回仅变更再回平铺）
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "仅变更").click();
+		collect(view.root, "gr-segbtn").find((button) => button.textContent === "平铺").click();
+		const flatAgain = rowsOf(view.root).find((row) => row.path === "src/lib/util.mjs");
+		assert.ok(flatAgain, "nested flat row renders again");
+		assert.deepEqual(collect(flatAgain.el, "gr-sub").map((n) => n.textContent), ["src/lib"], "dirname sub returns in flat list");
 		view.destroy();
 	});
 });

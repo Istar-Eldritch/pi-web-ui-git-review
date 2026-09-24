@@ -325,11 +325,11 @@ export const NAVIGATOR_CSS = `
 /* R18：全树未变更行可点（预览态）—— 整行降调、悬息恢复，与变更行区分。 */
 .gr-row.preview { color: var(--gr-dim); }
 .gr-row.preview:hover { color: var(--text, #e6e8ef); }
-.gr-st { flex: none; min-width: 13px; text-align: center; font-family: ui-monospace, Menlo, Consolas, monospace; font-weight: 700; font-size: 11px; }
-.gr-st.A { color: var(--gr-green); }
-.gr-st.D { color: var(--gr-red); }
-.gr-st.M, .gr-st.T { color: var(--gr-amber); }
-.gr-st.R, .gr-st.C { color: var(--gr-accent); }
+/* 状态不再用字母徽标 —— 直接给文件名上状态色（A 绿 / D 红 / M·T 琥珀 / R·C 主题色）。 */
+.gr-name.A { color: var(--gr-green); }
+.gr-name.D { color: var(--gr-red); }
+.gr-name.M, .gr-name.T { color: var(--gr-amber); }
+.gr-name.R, .gr-name.C { color: var(--gr-accent); }
 .gr-main { flex: 1 1 auto; min-width: 0; }
 .gr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gr-sub { font-size: 11px; color: var(--gr-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -885,9 +885,12 @@ export function createNavigator(opts = {}) {
 		return wrap;
 	}
 
-	/** 文件行（Phase 1 /review 行契约：status 字母、add/del、rename old→new、flags；
-	 *  R18：changed:false 的全树未变更行也可点 —— preview 态预览 + 评论）。 */
-	function fileRow(file, { depth = 0, selected = false, changed = true } = {}) {
+	/** 文件行（Phase 1 /review 行契约：status 着色在文件名上、add/del、rename old→new、flags；
+	 *  R18：changed:false 的全树未变更行也可点 —— preview 态预览 + 评论。
+	 *  R26：文件名下的所在目录副行只在**平铺清单**展示（opts.dirSub，仅 renderChangedList
+	 *  的平铺分支传 true）—— 树形/全树的目录结构本身已表达路径，副行是重复；
+	 *  rename 的「old → new」不受影响，树形里也保留（树上表达不了的评审信息）。 */
+	function fileRow(file, { depth = 0, selected = false, changed = true, dirSub = false } = {}) {
 		const row = el("div", {
 			class: `gr-row${changed ? "" : " preview"}${selected ? " selected" : ""}`,
 			style: `padding-left:${8 + depth * 12}px`,
@@ -896,10 +899,9 @@ export function createNavigator(opts = {}) {
 		});
 		const main = el("div", { class: "gr-main" });
 		const name = file.path.split("/").pop() || file.path;
-		const sub = renameText(file) ?? (file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : null);
+		const sub = renameText(file) ?? (dirSub && file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : null);
 		if (changed) {
-			row.append(el("span", { class: `gr-st ${file.status ?? ""}`, text: file.status ?? "?" }));
-			main.append(el("div", { class: "gr-name", text: name }));
+			main.append(el("div", { class: `gr-name${file.status ? ` ${file.status}` : ""}`, text: name }));
 			if (sub) main.append(el("div", { class: "gr-sub", text: sub }));
 			row.append(main);
 			row.append(countsSpan(file.add, file.del));
@@ -1070,7 +1072,8 @@ export function createNavigator(opts = {}) {
 			}
 		} else {
 			for (const file of files) {
-				const row = fileRow(file, { selected: store.getState().selectedPath === file.path });
+				// R26：平铺清单 = 唯一展示所在目录副行的地方（树形/全树不重复）。
+				const row = fileRow(file, { selected: store.getState().selectedPath === file.path, dirSub: true });
 				model.rows.push({ el: row, file });
 				box.append(row);
 			}
